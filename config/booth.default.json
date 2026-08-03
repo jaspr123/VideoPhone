@@ -1,0 +1,16 @@
+{
+  "camera_device": "/dev/video0",
+  "record_resolution": "1280x720",
+  "record_fps": 30,
+  "record_input_format": "h264",
+  "audio_device": "plughw:CARD=Device,DEV=0",
+  "audio_sample_rate": 48000,
+  "audio_channels": 1,
+  "audio_bitrate": "160k",
+  "countdown_seconds": 3,
+  "max_recording_seconds": 90,
+  "output_dir": "recordings",
+  "log_dir": "logs",
+  "preview_resolution": "1024x576",
+  "preview_fps": 20
+}
