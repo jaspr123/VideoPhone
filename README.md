@@ -135,6 +135,38 @@ Key fields:
 | `max_recording_seconds`  | Recording auto-stop limit                           |
 | `output_dir` / `log_dir` | Paths relative to the repository root               |
 | `preview_resolution` / `preview_fps` | Live preview quality (independent of recording quality) |
+| `av_sync_offset_ms`      | Manual A/V sync correction, in milliseconds. `0` = no correction (default). See "Fixing audio/video sync" below. |
+
+## Fixing audio/video sync
+
+If recordings play back with audio and video out of sync, first figure out
+whether it's a **constant offset** (same gap from start to end of the clip)
+or **drift** (gets worse the longer the recording runs):
+
+1. Record a short test clip that includes a sharp, distinct sound synced to
+   a visible action — a single clap works well.
+2. Play it back and note which is ahead, and by roughly how much (in
+   milliseconds), at the start of the clip vs. near the end.
+
+**Constant offset** (most common — usually caused by the USB webcam's
+onboard H.264 encoder adding more latency than the microphone's audio
+path): set `av_sync_offset_ms` in your config:
+
+- Video plays *before* its matching sound (video ahead) → use a **positive**
+  value, e.g. `150`, to delay video by that many milliseconds.
+- Audio plays *before* its matching action (audio ahead) → use a
+  **negative** value, e.g. `-150`, to delay audio instead.
+
+Start with a rough estimate, re-record the clap test, and adjust the value
+up or down until the clap lines up. Typical offsets are well under a
+second (the config accepts -5000 to 5000 ms).
+
+**Drift that grows over the recording** is a different, harder problem
+(usually a clock-rate mismatch between the camera and microphone) and is
+not fixed by `av_sync_offset_ms`. If you see this, note how many seconds
+it drifts over how long a recording, and it'll need investigating on the
+actual hardware (e.g. re-encoding video to a constant frame rate instead
+of copying it, at a CPU cost).
 
 ## Logs
 

@@ -66,6 +66,12 @@ class BoothConfig:
     log_dir: Path
     preview_resolution: str
     preview_fps: int
+    # Manual A/V sync correction (PROJECT_SPEC.md section 21, known risk #7:
+    # "Audio sync may need a device-specific offset"). Positive delays video
+    # relative to audio (use when video is ahead / plays too early). Negative
+    # delays audio relative to video (use when audio is ahead / plays too
+    # early). Optional; defaults to 0 (no correction) for existing configs.
+    av_sync_offset_ms: int = 0
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -147,6 +153,13 @@ class BoothConfig:
         if not log_dir:
             raise ConfigError("log_dir must not be empty")
 
+        av_sync_offset_ms = data.get("av_sync_offset_ms", 0)
+        if not isinstance(av_sync_offset_ms, int) or not (-5000 <= av_sync_offset_ms <= 5000):
+            raise ConfigError(
+                "av_sync_offset_ms must be an integer between -5000 and 5000, "
+                f"got {av_sync_offset_ms!r}"
+            )
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -162,6 +175,7 @@ class BoothConfig:
             log_dir=(base_dir / log_dir).resolve(),
             preview_resolution=str(data["preview_resolution"]).strip(),
             preview_fps=preview_fps,
+            av_sync_offset_ms=av_sync_offset_ms,
         )
 
     @classmethod

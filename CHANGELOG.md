@@ -45,3 +45,25 @@
   WND_PROP_FULLSCREEN, ...)` as in the prototype.
 - Added `cv2.CAP_V4L2` backend hint and `CAP_PROP_BUFFERSIZE=1` to the
   preview capture for lower latency, matching the prototype.
+
+## Unreleased — Fix hardware script microphone check
+
+- Fixed `scripts/test_hardware.sh`: the microphone check grepped for
+  `[CARDNAME` in `arecord -l` output, but the short card ID appears right
+  after `card N: `, not inside the brackets (that's the longer description).
+  The check always failed even when the microphone was present and working.
+  Now also supports matching a raw `plughw:N,M` / `hw:N,M` device by card
+  index, in addition to the `CARD=NAME` form.
+
+## Unreleased — Configurable A/V sync offset
+
+- Added `av_sync_offset_ms` to booth configuration (default `0`, range
+  -5000 to 5000) to correct a constant, device-specific audio/video sync
+  offset (PROJECT_SPEC.md section 21, known risk #7) without re-encoding
+  video. Positive values delay video via ffmpeg's `-itsoffset`; negative
+  values delay audio.
+- Documented a calibration procedure (clap test) in the README, and how to
+  tell a constant offset apart from progressive drift, which this setting
+  does not fix.
+- Added unit tests for the new config field and for where `-itsoffset` is
+  inserted in the ffmpeg command for positive/negative/zero offsets.

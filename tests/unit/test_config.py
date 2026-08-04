@@ -46,6 +46,24 @@ def test_default_config_file_is_valid():
     assert config.record_fps == 30
     assert config.audio_device == "plughw:CARD=Device,DEV=0"
     assert config.max_recording_seconds == 90
+    assert config.av_sync_offset_ms == 0
+
+
+def test_av_sync_offset_ms_defaults_to_zero_when_absent():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.av_sync_offset_ms == 0
+
+
+@pytest.mark.parametrize("offset", [-5000, -150, 0, 150, 5000])
+def test_av_sync_offset_ms_accepts_values_in_range(offset):
+    config = BoothConfig.from_dict(valid_config_dict(av_sync_offset_ms=offset))
+    assert config.av_sync_offset_ms == offset
+
+
+@pytest.mark.parametrize("offset", [5001, -5001, 150.5, "150"])
+def test_av_sync_offset_ms_rejects_out_of_range_or_non_int(offset):
+    with pytest.raises(ConfigError):
+        BoothConfig.from_dict(valid_config_dict(av_sync_offset_ms=offset))
 
 
 def test_missing_key_raises():

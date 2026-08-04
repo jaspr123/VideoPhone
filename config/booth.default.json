@@ -12,5 +12,6 @@
   "output_dir": "recordings",
   "log_dir": "logs",
   "preview_resolution": "1024x576",
-  "preview_fps": 20
+  "preview_fps": 20,
+  "av_sync_offset_ms": 0
 }
