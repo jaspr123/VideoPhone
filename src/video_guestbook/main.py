@@ -4,6 +4,12 @@ Milestone 1 scope only: full-screen MJPEG preview, Spacebar start/stop,
 countdown, recording via ffmpeg, save validation, and return to READY.
 Hook-switch, themes, admin UI and cloud sync are intentionally not
 implemented yet (see PROJECT_SPEC.md section 23).
+
+Camera/ffmpeg handoff: the USB webcam can only be held open by one process
+at a time. This mirrors the confirmed working prototype (legacy/booth.py):
+the OpenCV preview capture is released just before ffmpeg opens the camera
+device for recording, and reopened (with retries) once ffmpeg exits. Do not
+read frames from self.capture while a recording is in progress.
 """
 
 from __future__ import annotations
@@ -15,12 +21,13 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from video_guestbook.config import BoothConfig, ConfigError
 from video_guestbook.logging_setup import get_session_adapter, setup_logging
 from video_guestbook.media.recorder import Recorder, RecorderError
 from video_guestbook.media.validation import validate_recording
-from video_guestbook.state_machine import BoothState, InvalidTransitionError, StateMachine
+from video_guestbook.state_machine import BoothState, StateMachine
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "booth.default.json"
@@ -33,19 +40,34 @@ KEY_Q = ord("q")
 SAVED_DISPLAY_SECONDS = 3.0
 ERROR_DISPLAY_SECONDS = 4.0
 
+# Camera release/reopen tuning, matched to the confirmed working prototype.
+CAMERA_RELEASE_SETTLE_SECONDS = 0.25
+CAMERA_REOPEN_ATTEMPTS = 10
+CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.3
+
+# States during which ffmpeg owns the camera device; the preview must not
+# touch it and instead shows the last frame captured before recording began.
+_CAMERA_RELEASED_STATES = frozenset({BoothState.RECORDING, BoothState.SAVING})
+
 _TEXT_COLOR = (255, 255, 255)
 _RECORDING_COLOR = (0, 0, 255)
 _ERROR_COLOR = (0, 0, 255)
 
 
 def _configure_capture(config: BoothConfig) -> cv2.VideoCapture:
-    capture = cv2.VideoCapture(config.camera_device)
+    capture = cv2.VideoCapture(config.camera_device, cv2.CAP_V4L2)
     capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     width, height = config.preview_width_height
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_FPS, config.preview_fps)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return capture
+
+
+def _blank_frame(config: BoothConfig):
+    width, height = config.preview_width_height
+    return np.zeros((height, width, 3), dtype=np.uint8)
 
 
 def _draw_overlay(frame, text_lines: list[str], color=_TEXT_COLOR) -> None:
@@ -64,6 +86,7 @@ class BoothApp:
         self.state_machine = StateMachine(logger=logger)
         self.recorder = Recorder(config, logger=logger)
         self.capture: cv2.VideoCapture | None = None
+        self._last_frame = None
         self._countdown_deadline: float | None = None
         self._state_entered_at: float = time.monotonic()
         self._last_result_reason: str = ""
@@ -72,12 +95,36 @@ class BoothApp:
     def open_camera(self) -> None:
         self.capture = _configure_capture(self.config)
         if not self.capture.isOpened():
+            self.capture = None
             raise RuntimeError(f"Could not open camera device {self.config.camera_device}")
 
     def close_camera(self) -> None:
         if self.capture is not None:
             self.capture.release()
             self.capture = None
+
+    def _reopen_camera_with_retry(self) -> bool:
+        """Release and reacquire the camera, retrying while ffmpeg lets it go.
+
+        The v4l2 device can take a moment to become available again after
+        ffmpeg exits, so this mirrors the proven prototype's retry loop
+        rather than failing on the first attempt.
+        """
+        self.close_camera()
+        for attempt in range(CAMERA_REOPEN_ATTEMPTS):
+            try:
+                self.open_camera()
+                return True
+            except RuntimeError as exc:
+                self.logger.debug(
+                    "camera reopen attempt %d/%d failed: %s",
+                    attempt + 1,
+                    CAMERA_REOPEN_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(CAMERA_REOPEN_RETRY_DELAY_SECONDS)
+        self.logger.error("could not reopen camera after %d attempts", CAMERA_REOPEN_ATTEMPTS)
+        return False
 
     def _enter_state(self, new_state: BoothState) -> None:
         self.state_machine.transition(new_state)
@@ -88,13 +135,20 @@ class BoothApp:
         self._countdown_deadline = time.monotonic() + self.config.countdown_seconds
 
     def _start_recording(self) -> None:
+        # ffmpeg needs exclusive access to the camera device: release the
+        # preview capture first and give the driver a moment to settle.
+        self.close_camera()
+        time.sleep(CAMERA_RELEASE_SETTLE_SECONDS)
+
         try:
             session = self.recorder.start()
         except RecorderError as exc:
             self.logger.error("failed to start recording: %s", exc)
             self._last_result_reason = str(exc)
+            self._reopen_camera_with_retry()
             self._enter_state(BoothState.ERROR)
             return
+
         self._session_log = get_session_adapter(self.logger, session.session_id)
         self._session_log.info("recording started -> %s", session.output_path)
         self._enter_state(BoothState.RECORDING)
@@ -106,10 +160,14 @@ class BoothApp:
         except RecorderError as exc:
             self.logger.error("failed to stop recording: %s", exc)
             self._last_result_reason = str(exc)
+            self._reopen_camera_with_retry()
             self._enter_state(BoothState.ERROR)
             return
 
         result = validate_recording(output_path)
+        # ffmpeg has exited either way; the camera is free again.
+        self._reopen_camera_with_retry()
+
         if result.ok:
             self._session_log.info(
                 "recording saved: duration=%.2fs size=%d bytes",
@@ -184,25 +242,38 @@ class BoothApp:
         elif state == BoothState.ERROR:
             _draw_overlay(frame, ["Something went wrong", self._last_result_reason], color=_ERROR_COLOR)
 
+    def _read_frame(self):
+        """Return the frame to display, honoring the camera/ffmpeg handoff."""
+        if self.state_machine.state in _CAMERA_RELEASED_STATES:
+            # ffmpeg owns the camera right now; freeze on the last preview frame.
+            return self._last_frame
+
+        if self.capture is not None:
+            ok, frame = self.capture.read()
+            if ok:
+                self._last_frame = frame
+            else:
+                self.logger.error("camera read failed")
+                if not self._reopen_camera_with_retry():
+                    if self.state_machine.state != BoothState.ERROR:
+                        self._last_result_reason = "camera read failed"
+                        self._enter_state(BoothState.ERROR)
+
+        return self._last_frame
+
     def run(self) -> None:
         self.open_camera()
-        cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         try:
             running = True
             while running:
-                assert self.capture is not None
-                ok, frame = self.capture.read()
-                if not ok:
-                    self.logger.error("camera read failed")
-                    if self.state_machine.state != BoothState.ERROR:
-                        self._last_result_reason = "camera read failed"
-                        self._enter_state(BoothState.ERROR)
-                    time.sleep(0.1)
-                else:
-                    self.tick()
-                    self.render(frame)
-                    cv2.imshow(WINDOW_NAME, frame)
+                frame = self._read_frame()
+                display = (frame if frame is not None else _blank_frame(self.config)).copy()
+
+                self.tick()
+                self.render(display)
+                cv2.imshow(WINDOW_NAME, display)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key != 0xFF:

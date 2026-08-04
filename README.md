@@ -25,14 +25,21 @@ Google Drive sync, themes, the admin UI and hook-switch integration are **out of
 scope** for this milestone and are not implemented (see later milestones in
 PROJECT_SPEC.md).
 
-> **Note:** This repository did not previously contain a working `booth.py` to
-> preserve — the prior prototype referenced in PROJECT_SPEC.md
-> (`~/video-booth/app/booth.py`) lives on the Raspberry Pi itself, outside of
-> version control. This Milestone 1 implementation was built fresh from the
-> spec's Milestone 1 requirements rather than migrated from that file. If you
-> have the original `booth.py`, copy it into this repo (e.g. under
-> `legacy/booth.py`) before making further changes, so it stays available for
-> comparison.
+> **Note:** [`legacy/booth.py`](legacy/booth.py) is a verbatim backup of the
+> confirmed-working prototype from `~/video-booth/app/booth.py`, tested on the
+> actual Raspberry Pi hardware. Its proven behavior has been folded into this
+> package — in particular:
+> - The USB webcam can only be opened by one process at a time, so the OpenCV
+>   preview capture is released just before ffmpeg opens the camera device to
+>   record, and reopened (with retries) once ffmpeg exits (`main.py`,
+>   `_reopen_camera_with_retry`).
+> - The ffmpeg audio flags (`-thread_queue_size`, `-use_wallclock_as_timestamps`,
+>   `-af aresample=async=1:first_pts=0`, `-avoid_negative_ts make_zero`) that
+>   fix real audio/video sync drift on this hardware (`media/ffmpeg.py`).
+> - The stdin `q` stop sequence with a `SIGINT` fallback if the pipe write
+>   fails (`media/recorder.py`).
+>
+> Do not edit `legacy/booth.py` — it's kept only as a reference/fallback.
 
 ## Repository layout
 
@@ -51,6 +58,7 @@ scripts/
   install.sh                 System + Python dependency installer
   test_hardware.sh            Camera/mic/ffmpeg/output-dir readiness check
 tests/unit/                 Automated unit tests (pytest)
+legacy/booth.py              Backup of the confirmed-working prototype (reference only)
 ```
 
 ## Installation (Raspberry Pi OS 64-bit)

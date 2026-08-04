@@ -34,8 +34,15 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
     """Build the ffmpeg argv for recording camera + microphone to MP4.
 
     Video is copied straight from the webcam's H.264 stream (no re-encode,
-    per PROJECT_SPEC.md section 16). Audio is encoded to AAC. The process is
-    expected to be stopped gracefully by writing 'q' to its stdin.
+    per PROJECT_SPEC.md section 16). Audio is captured as-is from ALSA and
+    resampled/encoded to AAC on the output side. The process is expected to
+    be stopped gracefully by writing 'q' to its stdin.
+
+    The flags here (thread_queue_size, use_wallclock_as_timestamps, the
+    aresample async filter, and avoid_negative_ts) match the confirmed
+    working Beta prototype (legacy/booth.py) and fix real audio/video sync
+    drift observed on this hardware -- do not remove them without re-testing
+    A/V sync on the Pi.
     """
     ffmpeg = find_ffmpeg()
     width, height = config.record_width_height
@@ -43,6 +50,10 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
     return [
         ffmpeg,
         "-y",
+        "-thread_queue_size",
+        "512",
+        "-use_wallclock_as_timestamps",
+        "1",
         "-f",
         "v4l2",
         "-input_format",
@@ -53,12 +64,12 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
         str(config.record_fps),
         "-i",
         config.camera_device,
+        "-thread_queue_size",
+        "512",
+        "-use_wallclock_as_timestamps",
+        "1",
         "-f",
         "alsa",
-        "-ar",
-        str(config.audio_sample_rate),
-        "-ac",
-        str(config.audio_channels),
         "-i",
         config.audio_device,
         "-map",
@@ -71,6 +82,14 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
         "aac",
         "-b:a",
         config.audio_bitrate,
+        "-ar",
+        str(config.audio_sample_rate),
+        "-ac",
+        str(config.audio_channels),
+        "-af",
+        "aresample=async=1:first_pts=0",
+        "-avoid_negative_ts",
+        "make_zero",
         "-t",
         str(config.max_recording_seconds),
         "-movflags",

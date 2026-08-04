@@ -8,6 +8,7 @@ by writing 'q' to ffmpeg's stdin (preserving current Beta behavior).
 from __future__ import annotations
 
 import logging
+import signal
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -102,11 +103,14 @@ class Recorder:
         if process.poll() is None:
             try:
                 if process.stdin is not None:
-                    process.stdin.write("q")
+                    process.stdin.write("q\n")
                     process.stdin.flush()
                     process.stdin.close()
-            except (BrokenPipeError, OSError) as exc:
-                self._logger.warning("could not write 'q' to ffmpeg stdin: %s", exc)
+            except (AttributeError, BrokenPipeError, OSError) as exc:
+                self._logger.warning(
+                    "could not write 'q' to ffmpeg stdin (%s), sending SIGINT instead", exc
+                )
+                process.send_signal(signal.SIGINT)
 
             try:
                 process.wait(timeout=_GRACEFUL_STOP_TIMEOUT_SECONDS)
