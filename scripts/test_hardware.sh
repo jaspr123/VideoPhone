@@ -78,12 +78,32 @@ else
 fi
 
 # 3. Microphone ALSA device exists
+#
+# `arecord -l` prints lines like:
+#   card 3: Device [FDUCE SL40 Audio Device], device 0: USB Audio [USB Audio]
+# The short card ID ("Device") sits right after "card N: ", NOT inside the
+# brackets (that's the longer human-readable description). Match on the ID
+# for a "CARD=NAME" audio_device, or on the numeric index for "hw:N,M" /
+# "plughw:N,M" style device strings.
 if command -v arecord >/dev/null 2>&1; then
+    ARECORD_OUTPUT=$(arecord -l 2>/dev/null)
     CARD_NAME=$(echo "$AUDIO_DEVICE" | sed -n 's/.*CARD=\([^,]*\).*/\1/p')
-    if [[ -n "$CARD_NAME" ]] && arecord -l 2>/dev/null | grep -qi "\[$CARD_NAME"; then
-        pass "microphone ALSA card '$CARD_NAME' found (arecord -l)"
+    CARD_INDEX=$(echo "$AUDIO_DEVICE" | sed -n 's/^[a-z]*hw:\([0-9]\+\).*/\1/p')
+
+    if [[ -n "$CARD_NAME" ]]; then
+        if echo "$ARECORD_OUTPUT" | grep -qiE "^card [0-9]+: ${CARD_NAME}\b"; then
+            pass "microphone ALSA card '$CARD_NAME' found (arecord -l)"
+        else
+            fail "microphone ALSA card '$CARD_NAME' not found in 'arecord -l'"
+        fi
+    elif [[ -n "$CARD_INDEX" ]]; then
+        if echo "$ARECORD_OUTPUT" | grep -qE "^card ${CARD_INDEX}:"; then
+            pass "microphone ALSA card index $CARD_INDEX found (arecord -l)"
+        else
+            fail "microphone ALSA card index $CARD_INDEX not found in 'arecord -l'"
+        fi
     else
-        fail "microphone ALSA card '${CARD_NAME:-$AUDIO_DEVICE}' not found in 'arecord -l'"
+        fail "could not parse a card name or index from audio_device '$AUDIO_DEVICE'"
     fi
 else
     fail "arecord not found on PATH (install alsa-utils)"
