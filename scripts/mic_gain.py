@@ -28,6 +28,7 @@ try:
         MixerError,
         find_capture_control,
         get_capture_percent,
+        get_raw_control_info,
         resolve_card_index,
         set_capture_percent,
     )
@@ -38,6 +39,7 @@ except ImportError:
         MixerError,
         find_capture_control,
         get_capture_percent,
+        get_raw_control_info,
         resolve_card_index,
         set_capture_percent,
     )
@@ -59,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="ALSA device, e.g. plughw:CARD=Device,DEV=0 (overrides config)")
     parser.add_argument("--set", type=int, default=None, metavar="PERCENT", help="Set capture level to this percent (0-100)")
     parser.add_argument("--persist", action="store_true", help="Run 'sudo alsactl store' after setting, so it survives reboot")
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Also print the full 'amixer sget' output (Playback + Capture lines), for verifying "
+        "that setting the capture level didn't also change a separate Playback/monitoring level",
+    )
     return parser.parse_args()
 
 
@@ -100,6 +108,10 @@ def main() -> int:
     print(f"device={device}")
     print(f"card={card_index}  control='{control}'  current={current}%")
 
+    if args.raw or args.set is not None:
+        print("--- amixer sget (before) ---")
+        print(get_raw_control_info(card_index, control))
+
     if args.set is None:
         return 0
 
@@ -112,6 +124,12 @@ def main() -> int:
         return 1
 
     print(f"set '{control}' to {target}%  (now reads back as {new_value}%)")
+    print("--- amixer sget (after) ---")
+    print(get_raw_control_info(card_index, control))
+    print(
+        "Check the two dumps above: if this control has a separate Playback "
+        "line, confirm it did NOT change too -- only Capture should have moved."
+    )
 
     if args.persist:
         result = subprocess.run(["sudo", "alsactl", "store"], capture_output=True, text=True)

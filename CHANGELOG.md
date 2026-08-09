@@ -125,3 +125,28 @@
   to run `alsactl store`. Written during live gain-tuning on real
   hardware where `alsamixer`'s TUI made it hard to confirm whether a
   change actually took effect between test runs.
+
+## Unreleased — Fix: mixer.py was reading/setting the wrong volume element
+
+- Real-hardware finding: this device's "Mic" ALSA control bundles a
+  Playback/monitoring level (shown in `alsamixer`'s `F3` view) and the
+  actual Capture level recording uses (shown in `F4`) under one name.
+  `amixer sget` prints the Playback line before the Capture line, and
+  `media/mixer.py` was matching the *first* `[NN%]` found anywhere in
+  that output -- silently reading (and likely also setting, via
+  `set_capture_percent`) the wrong element. A screenshot showing Capture
+  at `7%` while `mic_test.py` still showed frequent 0 dBFS clipping is
+  what surfaced this.
+- Fixed `get_capture_percent` (and the new `get_raw_control_info`) to
+  anchor specifically to the line containing "Capture" rather than the
+  first percentage in the output. Documented in the module docstring so
+  it isn't silently reintroduced.
+- `set_capture_percent`'s command itself is unchanged (still `amixer sset
+  NAME VALUE%` with no direction qualifier) because alsa-utils has no
+  reliably version-independent "capture only" flag for `sset` -- this is
+  flagged as unverified in its docstring. `mic_gain.py --set` now prints
+  the full `amixer sget` output before and after so a human can visually
+  confirm the Playback line didn't also move.
+- Added regression tests in `test_mixer.py` using a combined
+  Playback+Capture fixture with deliberately different percentages, plus
+  tests for `get_raw_control_info` and the "no Capture element" case.

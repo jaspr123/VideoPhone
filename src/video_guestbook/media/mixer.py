@@ -11,6 +11,14 @@ control name is discovered at runtime via `amixer scontrols` rather than
 hardcoded. This is a heuristic (looks for a control with "mic" or "capture"
 in its name) and has only been exercised against the devices mentioned in
 PROJECT_SPEC.md -- callers must not let a failure here block recording.
+
+Some devices' "Mic" control bundles a Playback element (a monitoring/
+sidetone level, visible in alsamixer's F3 view) together with the actual
+Capture element (visible in alsamixer's F4 view, what recording actually
+uses) under the same name -- `amixer sget` prints Playback before Capture
+for these. All percent-reading in this module is anchored specifically to
+the "Capture" line for that reason; do not naively grab the first `[NN%]`
+in `amixer sget` output.
 """
 
 from __future__ import annotations
@@ -25,7 +33,14 @@ from video_guestbook.media.audio_levels import find_arecord
 _CARD_NAME_RE = re.compile(r"CARD=([^,]+)")
 _CARD_INDEX_RE = re.compile(r"^[a-z]*hw:(\d+)", re.IGNORECASE)
 _CONTROL_NAME_RE = re.compile(r"Simple mixer control '([^']+)'")
-_PERCENT_RE = re.compile(r"\[(\d+)%\]")
+
+# Some controls (commonly named 'Mic' on USB audio adapters) bundle BOTH a
+# playback/monitoring volume AND a capture volume under the same name --
+# `amixer sget` prints the Playback line before the Capture line for these.
+# A naive "first [NN%] in the output" match silently reads/sets the
+# monitoring level instead of the actual recording gain. Always anchor to
+# the line that says "Capture".
+_CAPTURE_PERCENT_RE = re.compile(r"Capture[^\[\n]*\[(\d+)%\]")
 
 
 class MixerError(RuntimeError):
@@ -101,7 +116,13 @@ def find_capture_control(card_index: int) -> str:
     )
 
 
-def get_capture_percent(card_index: int, control: str) -> int:
+def get_raw_control_info(card_index: int, control: str) -> str:
+    """Return the full, unparsed `amixer sget` output for a control.
+
+    Useful for diagnostics: shows both the Playback and Capture lines (if
+    the control has both) so a human can see exactly what's configured
+    rather than trusting a single parsed number.
+    """
     amixer = find_amixer()
     try:
         result = subprocess.run(
@@ -116,13 +137,32 @@ def get_capture_percent(card_index: int, control: str) -> int:
         raise MixerError(
             f"'amixer sget {control}' failed (exit {result.returncode}): {result.stderr.strip()}"
         )
-    match = _PERCENT_RE.search(result.stdout)
+    return result.stdout
+
+
+def get_capture_percent(card_index: int, control: str) -> int:
+    stdout = get_raw_control_info(card_index, control)
+    match = _CAPTURE_PERCENT_RE.search(stdout)
     if not match:
-        raise MixerError(f"could not parse a capture level for control {control!r}")
+        raise MixerError(
+            f"could not find a Capture level for control {control!r} "
+            f"(is this actually a capture-capable control? raw output: {stdout!r})"
+        )
     return int(match.group(1))
 
 
 def set_capture_percent(card_index: int, control: str, percent: int) -> None:
+    """Set a control's Capture volume.
+
+    CAVEAT (unverified on real hardware): for a combined control that has
+    both Playback and Capture volume elements (see get_capture_percent's
+    docstring), plain `amixer sset NAME VALUE%` may set BOTH elements to
+    the same value rather than Capture alone -- alsa-utils' CLI does not
+    have a universally reliable "capture only" qualifier across versions.
+    Callers that care whether the Playback/monitoring level was also
+    changed should call get_raw_control_info() before and after and
+    compare, rather than trusting this blindly.
+    """
     percent = max(0, min(100, percent))
     amixer = find_amixer()
     try:

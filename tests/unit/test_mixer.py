@@ -7,6 +7,7 @@ from video_guestbook.media.mixer import (
     MixerError,
     find_capture_control,
     get_capture_percent,
+    get_raw_control_info,
     list_capture_controls,
     nudge_capture_gain,
     resolve_card_index,
@@ -29,12 +30,28 @@ Simple mixer control 'Mic Boost',0
 Simple mixer control 'Auto Gain Control',0
 """
 
+
+# A combined control with BOTH a Playback (monitoring/sidetone) element AND
+# a Capture element, deliberately at DIFFERENT percentages -- this matches
+# what was actually observed on real hardware (Playback shown in
+# alsamixer's F3 view, Capture in F4) and is the exact scenario that
+# revealed the "grabs the first [NN%] in the output" bug.
 SGET_OUTPUT = """\
 Simple mixer control 'Mic',0
+  Capabilities: pvolume pvolume-joined pswitch pswitch-joined cvolume cvolume-joined cswitch cswitch-joined
+  Playback channels: Mono
+  Capture channels: Mono
+  Limits: Playback 0 - 87, Capture 0 - 16
+  Mono: Playback 76 [87%] [-10.50dB] [on]
+  Mono: Capture 1 [49%] [16.50dB] [on]
+"""
+
+SGET_OUTPUT_PLAYBACK_ONLY = """\
+Simple mixer control 'Speaker',0
   Capabilities: pvolume pswitch pswitch-joined
   Playback channels: Mono
   Limits: Playback 0 - 87
-  Mono: Playback 43 [49%] [16.50dB] [on]
+  Mono: Playback 76 [87%] [-10.50dB] [on]
 """
 
 
@@ -131,13 +148,51 @@ def test_list_capture_controls_raises_on_nonzero_exit(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# get_capture_percent / set_capture_percent
+# get_raw_control_info / get_capture_percent / set_capture_percent
 # ---------------------------------------------------------------------------
+
+
+def test_get_raw_control_info_returns_full_output_unparsed(monkeypatch):
+    monkeypatch.setattr(mixer_module.subprocess, "run", lambda *a, **k: _completed(SGET_OUTPUT))
+    raw = get_raw_control_info(3, "Mic")
+    assert "Playback 76 [87%]" in raw
+    assert "Capture 1 [49%]" in raw
+
+
+def test_get_raw_control_info_raises_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        mixer_module.subprocess,
+        "run",
+        lambda *a, **k: _completed("", returncode=1, stderr="no such control"),
+    )
+    with pytest.raises(MixerError, match="no such control"):
+        get_raw_control_info(3, "Mic")
 
 
 def test_get_capture_percent_parses_value(monkeypatch):
     monkeypatch.setattr(mixer_module.subprocess, "run", lambda *a, **k: _completed(SGET_OUTPUT))
     assert get_capture_percent(3, "Mic") == 49
+
+
+def test_get_capture_percent_ignores_playback_line_on_combined_control(monkeypatch):
+    """Regression test: must return the Capture value (49%), not the
+    Playback/monitoring value (87%) that appears earlier in the same
+    `amixer sget` output. This is the exact bug found via real hardware:
+    a combined 'Mic' control's Playback line was being read instead of
+    Capture, so gain reads/adjustments were silently touching the wrong
+    element."""
+    monkeypatch.setattr(mixer_module.subprocess, "run", lambda *a, **k: _completed(SGET_OUTPUT))
+    percent = get_capture_percent(3, "Mic")
+    assert percent == 49
+    assert percent != 87
+
+
+def test_get_capture_percent_raises_when_control_has_no_capture_element(monkeypatch):
+    monkeypatch.setattr(
+        mixer_module.subprocess, "run", lambda *a, **k: _completed(SGET_OUTPUT_PLAYBACK_ONLY)
+    )
+    with pytest.raises(MixerError, match="Capture"):
+        get_capture_percent(3, "Speaker")
 
 
 def test_get_capture_percent_raises_when_unparseable(monkeypatch):

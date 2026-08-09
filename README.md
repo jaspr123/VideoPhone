@@ -260,6 +260,18 @@ back after setting, so there's no ambiguity about what's configured. Pair
 this with `scripts/mic_test.py`: set a level, run the test, check the clip
 count, adjust, repeat.
 
+> **Combined Playback/Capture controls:** some USB audio adapters expose a
+> "Mic" control with *two different levels bundled under one name* — a
+> Playback/monitoring level (visible in `alsamixer`'s `F3` view) and the
+> actual Capture level that recording uses (visible in `F4`). These can
+> read very differently (e.g. Playback at 87% while Capture sits at 7%).
+> `mic_gain.py` and the app both always read/report the **Capture** line
+> specifically — if you're checking by hand in `alsamixer`, make sure
+> you're looking at the `F4` (Capture) view, not `F3` (Playback), or the
+> number won't match what's actually feeding the recording. Use
+> `--raw`/`--set` on `mic_gain.py` to see the full `amixer` output and
+> confirm which line actually moved.
+
 ## Automatic countdown-time mic level check
 
 While the countdown is running, the app samples the microphone in the
