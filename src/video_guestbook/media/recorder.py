@@ -16,11 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from video_guestbook.config import BoothConfig
-from video_guestbook.media.ffmpeg import build_record_command
+from video_guestbook.media.ffmpeg import build_record_command, needs_deferred_transcode
 
 _FILENAME_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 _GRACEFUL_STOP_TIMEOUT_SECONDS = 10
 _TERMINATE_TIMEOUT_SECONDS = 5
+_RAW_CONTAINER_EXTENSION = "mkv"  # MJPEG doesn't map cleanly into MP4
 
 
 class RecorderError(RuntimeError):
@@ -30,8 +31,14 @@ class RecorderError(RuntimeError):
 @dataclass(frozen=True)
 class RecordingSession:
     session_id: str
-    output_path: Path
     started_at: datetime
+    # Where the live ffmpeg process actually writes -- a raw MJPEG capture
+    # when needs_transcode is true, otherwise already the final file.
+    live_output_path: Path
+    # Where the final, playable H.264 MP4 should end up. Equal to
+    # live_output_path unless needs_transcode is true.
+    final_output_path: Path
+    needs_transcode: bool
 
 
 def generate_session_id(now: datetime | None = None) -> str:
@@ -46,6 +53,14 @@ def build_output_filename(session_id: str) -> str:
 
 def build_output_path(output_dir: Path, session_id: str) -> Path:
     return output_dir / build_output_filename(session_id)
+
+
+def build_raw_output_filename(session_id: str) -> str:
+    return f"{session_id}.raw.{_RAW_CONTAINER_EXTENSION}"
+
+
+def build_raw_output_path(output_dir: Path, session_id: str) -> Path:
+    return output_dir / build_raw_output_filename(session_id)
 
 
 class Recorder:
@@ -69,8 +84,14 @@ class Recorder:
 
         self._config.output_dir.mkdir(parents=True, exist_ok=True)
         session_id = generate_session_id()
-        output_path = build_output_path(self._config.output_dir, session_id)
-        command = build_record_command(self._config, output_path)
+        transcode_needed = needs_deferred_transcode(self._config)
+        if transcode_needed:
+            live_output_path = build_raw_output_path(self._config.output_dir, session_id)
+            final_output_path = build_output_path(self._config.output_dir, session_id)
+        else:
+            live_output_path = build_output_path(self._config.output_dir, session_id)
+            final_output_path = live_output_path
+        command = build_record_command(self._config, live_output_path)
 
         self._logger.info("starting recording session %s: %s", session_id, " ".join(command))
         try:
@@ -87,12 +108,21 @@ class Recorder:
         self._process = process
         self._session = RecordingSession(
             session_id=session_id,
-            output_path=output_path,
+            live_output_path=live_output_path,
+            final_output_path=final_output_path,
+            needs_transcode=transcode_needed,
             started_at=datetime.now(timezone.utc),
         )
         return self._session
 
-    def stop(self) -> Path:
+    def stop(self) -> RecordingSession:
+        """Stop the ffmpeg process and return the session that was recording.
+
+        session.live_output_path is the file that was actually just
+        written (raw or final -- see RecordingSession); callers should
+        validate that, then check session.needs_transcode to decide
+        whether to enqueue a background transcode to session.final_output_path.
+        """
         if self._process is None or self._session is None:
             raise RecorderError("No recording in progress")
 
@@ -141,4 +171,4 @@ class Recorder:
 
         self._process = None
         self._session = None
-        return session.output_path
+        return session

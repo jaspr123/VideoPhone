@@ -31,26 +31,52 @@ def find_ffprobe() -> str:
 
 
 # Cameras with no onboard H.264 encoder (record_input_format == "mjpeg")
-# need the video re-encoded on the Pi's CPU instead of copied. These settings
-# are a starting point, not a tuned result -- they have not been verified to
-# hold 1280x720@30fps in real time on a Pi 4. If recordings drop frames or
-# lag, try a faster preset (already at the fastest) or a lower resolution/fps
-# in config before anything else.
+# need the video re-encoded on the Pi's CPU somewhere -- either live
+# ("fast" recording_mode) or deferred ("quality" mode, see
+# build_transcode_command). These settings are a starting point, not a
+# tuned result -- they have not been verified to hold 1280x720@30fps in
+# real time on a Pi 4. If recordings drop frames or lag in "fast" mode, try
+# a faster preset (already at the fastest) or a lower resolution/fps in
+# config before anything else.
 _SOFTWARE_ENCODE_PRESET = "ultrafast"
 _SOFTWARE_ENCODE_BITRATE = "4M"
 
 
-def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
-    """Build the ffmpeg argv for recording camera + microphone to MP4.
+def is_live_video_copied(config: BoothConfig) -> bool:
+    """True if the live recording command copies video with no re-encode.
 
-    When the camera provides its own H.264 stream (record_input_format ==
-    "h264"), video is copied straight through with no re-encode, per
-    PROJECT_SPEC.md section 16. Some cameras (e.g. ones with no onboard H.264
-    encoder, only MJPEG) can't provide that -- for those, set
-    record_input_format to "mjpeg" and video is software-encoded to H.264
-    instead, at a real CPU cost. Audio is captured as-is from ALSA and
-    resampled/encoded to AAC on the output side. The process is expected to
-    be stopped gracefully by writing 'q' to its stdin.
+    Always true for cameras with real onboard H.264 (record_input_format ==
+    "h264"): -c:v copy is both the fastest and highest-quality option, so
+    recording_mode has no effect there. For MJPEG-only cameras, true only in
+    "quality" mode -- the raw MJPEG is captured as-is (near-zero CPU, no
+    audio-dropout risk) and build_transcode_command() converts it to the
+    final H.264 MP4 afterward, with no live deadline. "fast" mode instead
+    transcodes live (real CPU cost, immediately final) and is only worth the
+    dropout risk if a busy event needs to avoid a background transcode
+    backlog.
+    """
+    return config.record_input_format == "h264" or config.recording_mode == "quality"
+
+
+def needs_deferred_transcode(config: BoothConfig) -> bool:
+    """True when the live capture produces raw video that isn't the final
+    playable file yet -- MJPEG-only camera in "quality" mode."""
+    return config.record_input_format == "mjpeg" and config.recording_mode == "quality"
+
+
+def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
+    """Build the ffmpeg argv for recording camera + microphone.
+
+    See is_live_video_copied() for when video is copied vs. software
+    re-encoded live. Audio is captured as-is from ALSA and resampled/encoded
+    to AAC on the output side either way. The process is expected to be
+    stopped gracefully by writing 'q' to its stdin.
+
+    When is_live_video_copied() is true because of "quality" mode (not
+    because the camera has real H.264), output_path should be a raw
+    container (e.g. .mkv, not .mp4 -- MJPEG doesn't map cleanly into MP4)
+    since this is an intermediate file for build_transcode_command(), not
+    the final deliverable. Recorder owns that path/naming decision.
 
     The flags here (thread_queue_size, use_wallclock_as_timestamps, the
     aresample async filter, and avoid_negative_ts) match the confirmed
@@ -88,7 +114,7 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
         audio_input = ["-itsoffset", f"{offset_seconds:.3f}"] + audio_input
     audio_input += ["-f", "alsa", "-i", config.audio_device]
 
-    if config.record_input_format == "h264":
+    if is_live_video_copied(config):
         video_encode = ["-c:v", "copy"]
     else:
         video_encode = [
@@ -139,6 +165,46 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
             str(output_path),
         ]
     )
+
+
+def build_transcode_command(input_path: Path, output_path: Path, config: BoothConfig) -> list[str]:
+    """Build the ffmpeg argv for the deferred "quality" mode transcode.
+
+    Converts a raw MJPEG capture (from build_record_command when
+    needs_deferred_transcode() is true) into the final playable H.264 MP4.
+    Audio is copied through untouched -- it was already properly AAC-encoded
+    during the live pass, no need to re-encode it twice.
+
+    This runs after the guest has already hung up, with no real-time
+    deadline, so however long it takes it can never cause an audio dropout
+    the way live encoding can.
+    """
+    ffmpeg = find_ffmpeg()
+    return [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        _SOFTWARE_ENCODE_PRESET,
+        "-pix_fmt",
+        "yuv420p",
+        "-b:v",
+        _SOFTWARE_ENCODE_BITRATE,
+        "-maxrate",
+        _SOFTWARE_ENCODE_BITRATE,
+        "-bufsize",
+        "8M",
+        "-r",
+        str(config.record_fps),
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
 
 
 def build_probe_command(media_path: Path) -> list[str]:

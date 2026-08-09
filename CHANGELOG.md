@@ -185,3 +185,48 @@
   `gpiozero.Button` monkeypatched at the module level so these run
   without `gpiozero` installed or real GPIO hardware) and config
   validation tests for the two new fields.
+
+## Unreleased — `recording_mode` setting: eliminate live-encode audio contention
+
+Root cause of the patchy/breaking-up audio on the MJPEG-only camera:
+software H.264 encoding during a live recording competes with real-time
+audio capture for the Pi's CPU. This adds a real fix (removes the
+contention entirely) alongside the existing config-tuning workaround
+(lower fps/resolution), as a selectable mode rather than a single
+hardcoded behavior.
+
+- Added `recording_mode` config field (`"fast"` | `"quality"`, default
+  `"quality"`), only meaningful when `record_input_format` is `"mjpeg"`:
+  - `quality`: live capture copies raw MJPEG (`-c:v copy`, near-zero CPU,
+    same resource profile a real-H.264 camera has) instead of transcoding
+    live. A background job converts it to the final H.264 MP4 after the
+    guest hangs up, when there's no real-time deadline to violate.
+  - `fast`: today's live-transcode behavior, unchanged. Immediately
+    final, but competes with audio capture for CPU. Only worth it if a
+    busy event risks the background transcode queue backing up.
+- `media/ffmpeg.py`: added `is_live_video_copied()` and
+  `needs_deferred_transcode()` as the single source of truth for which
+  path applies (shared by the command builder, `recorder.py`, and
+  `main.py`), and `build_transcode_command()` for the deferred
+  raw-to-final pass (video re-encoded, audio just copied through since
+  it was already properly encoded during the live pass).
+- `media/recorder.py`: `RecordingSession` now carries `live_output_path`
+  (what ffmpeg actually just wrote -- raw `.mkv` or final `.mp4`),
+  `final_output_path`, and `needs_transcode`; raw files use a
+  `<session-id>.raw.mkv` naming convention (MJPEG doesn't map cleanly
+  into MP4). `Recorder.stop()` now returns the full session instead of
+  just a path, so callers have everything needed to decide what happens
+  next.
+- Added `media/transcode.py`: a single-worker background FIFO queue.
+  Raw files are never deleted, success or failure, so a message is never
+  silently lost -- a failed transcode just leaves the guest's raw
+  recording as the only copy, logged clearly with the preserved path.
+- `main.py`: starts/stops the transcode queue with the app; after a
+  `quality`-mode recording validates successfully, enqueues the
+  background job and returns to `SAVED` immediately rather than making
+  the guest wait for the transcode.
+- Added `tests/unit/test_recorder.py` (raw-vs-final path selection per
+  mode, start/stop lifecycle) and `tests/unit/test_transcode.py` (queue
+  ordering, success/failure handling, all mocked -- no real ffmpeg or
+  threading races), plus `recording_mode` config validation tests and
+  ffmpeg command tests for both modes.

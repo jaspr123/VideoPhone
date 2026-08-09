@@ -60,6 +60,7 @@ src/video_guestbook/        Application package
     validation.py              Post-recording validation via ffprobe
     audio_levels.py            Mic level sampling/classification (dBFS via arecord)
     mixer.py                   ALSA capture-gain discovery + one-shot nudge
+    transcode.py                Background raw->H.264 transcode queue ("quality" mode)
 scripts/
   install.sh                 System + Python dependency installer
   test_hardware.sh            Camera/mic/amixer/ffmpeg/output-dir readiness check
@@ -161,7 +162,7 @@ Key fields:
 | `camera_device`         | v4l2 device path, e.g. `/dev/video0`                |
 | `record_resolution`     | `WIDTHxHEIGHT`, e.g. `1280x720`                     |
 | `record_fps`             | Recording frame rate (1-60)                         |
-| `record_input_format`    | `h264` (copy, no CPU cost) or `mjpeg` (software re-encode, real CPU cost). See "Camera compatibility" below. |
+| `record_input_format`    | `h264` (copy, no CPU cost) or `mjpeg` (see `recording_mode`). See "Camera compatibility" below. |
 | `audio_device`           | Stable ALSA identifier, e.g. `plughw:CARD=Device,DEV=0` |
 | `audio_sample_rate`      | 8000/16000/22050/32000/44100/48000                  |
 | `audio_channels`         | 1 (mono) or 2 (stereo)                              |
@@ -173,6 +174,7 @@ Key fields:
 | `av_sync_offset_ms`      | Manual A/V sync correction, in milliseconds. `0` = no correction (default). See "Fixing audio/video sync" below. |
 | `hook_switch_enabled`    | `true` (default) to use the physical receiver switch; `false` for Spacebar-only |
 | `hook_switch_gpio_pin`   | BCM GPIO pin number for the primary hook-switch signal (default `17`, per PROJECT_SPEC.md section 4) |
+| `recording_mode`         | `quality` (default, deferred background transcode, no audio-dropout risk) or `fast` (live transcode, immediately final). Only matters when `record_input_format` is `mjpeg`. See "Recording modes" below. |
 
 ## Camera compatibility (H.264 vs MJPEG)
 
@@ -187,19 +189,46 @@ v4l2-ctl -d /dev/video0 --list-formats-ext
 - **If `H264` is listed** for your target resolution/fps: set
   `record_input_format: "h264"`. The camera's H.264 bitstream is copied
   straight into the MP4 with zero CPU cost (this is the original design,
-  per PROJECT_SPEC.md section 16).
+  per PROJECT_SPEC.md section 16). `recording_mode` (below) has no effect
+  in this case -- copy is already both the fastest and highest-quality option.
 - **If only `MJPG`/`YUYV` are listed** (no `H264`): set
-  `record_input_format: "mjpeg"`. Video is then software-encoded to H.264
-  on the Pi's CPU (`libx264`, `ultrafast` preset, ~4 Mbps) instead of
-  copied. This has **not** been verified to hold 1280x720@30fps in real
-  time on a Pi 4 — test it with a real recording and watch for dropped
-  frames or preview lag. If it can't keep up, try a lower
-  `record_resolution` or `record_fps` before anything else.
+  `record_input_format: "mjpeg"`. How the camera's raw MJPEG becomes a
+  final H.264 file then depends on `recording_mode` -- see the next section.
 
 Setting `record_input_format` to a value the camera doesn't actually
 support (e.g. `h264` on a camera with no H.264 output) will fail to start
 recording — this is the single most common cause of "the app won't
 record" after swapping cameras.
+
+## Recording modes: `fast` vs `quality`
+
+Only relevant when `record_input_format: "mjpeg"` (a camera with no onboard
+H.264 -- see above). Controlled by `recording_mode` in config:
+
+- **`quality` (default).** The live recording just copies the camera's raw
+  MJPEG (`-c:v copy`, near-zero CPU cost, the same resource profile a
+  real-H.264 camera has) alongside the normal AAC audio capture. Nothing
+  CPU-heavy runs while the guest is actually recording, so there's no
+  audio-dropout risk from encoder contention. Once the guest hangs up, a
+  background job (`media/transcode.py`) converts that raw capture into the
+  final playable H.264 MP4 -- this can take a real amount of wall-clock
+  time (it's re-encoding video), but since nothing is "live" anymore by
+  then, however long it takes can never cause an audio glitch. The raw
+  file (`<session-id>.raw.mkv`) is kept alongside the final file
+  (`<session-id>.mp4`) and is **never deleted automatically** -- it's the
+  backup copy, and the only copy left if a transcode ever fails.
+- **`fast`.** Transcodes live instead (real CPU cost while recording,
+  competes with audio capture -- this is what caused patchy/breaking-up
+  audio on this project's MJPEG-only camera). The file is immediately
+  final the moment the guest hangs up, with no background processing step
+  or queue. Worth choosing over `quality` only if a busy event risks
+  guests recording faster than the background transcode queue can keep up
+  (each queued job processes one at a time, oldest first).
+
+Check `logs/booth.log` for lines starting with `queued transcode for
+session`, `transcoding session`, and `transcode complete for session` (or
+`transcode failed for session`, which always names the preserved raw file)
+to watch the background queue's progress.
 
 ## Fixing audio/video sync
 
@@ -360,10 +389,17 @@ Each recording session logs a unique session ID alongside every message.
 
 ## Recordings
 
-Saved MP4s are written to `recordings/<timestamp>_<session-id>.mp4`. A
+Final MP4s are written to `recordings/<timestamp>_<session-id>.mp4`. A
 recording is only considered complete after ffmpeg exits and `ffprobe`
 confirms the file has both a video and an audio stream and meets the
 minimum duration.
+
+In `quality` recording_mode with an MJPEG-only camera, you'll also see
+`recordings/<timestamp>_<session-id>.raw.mkv` files -- the raw capture
+that gets background-transcoded into the matching `.mp4`. These are kept
+permanently (never auto-deleted) as the backup copy; if you ever see a
+`.raw.mkv` with no matching `.mp4`, check `logs/booth.log` for a
+`transcode failed` line to see why.
 
 ## Testing
 

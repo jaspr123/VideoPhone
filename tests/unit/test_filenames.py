@@ -5,6 +5,8 @@ from pathlib import Path
 from video_guestbook.media.recorder import (
     build_output_filename,
     build_output_path,
+    build_raw_output_filename,
+    build_raw_output_path,
     generate_session_id,
 )
 
@@ -36,3 +38,22 @@ def test_build_output_path_joins_dir_and_filename(tmp_path):
     path = build_output_path(tmp_path, session_id)
     assert path == tmp_path / f"{session_id}.mp4"
     assert isinstance(path, Path)
+
+
+def test_build_raw_output_filename():
+    assert (
+        build_raw_output_filename("20260912_143005_abcd1234")
+        == "20260912_143005_abcd1234.raw.mkv"
+    )
+
+
+def test_build_raw_output_path_joins_dir_and_filename(tmp_path):
+    session_id = "20260912_143005_abcd1234"
+    path = build_raw_output_path(tmp_path, session_id)
+    assert path == tmp_path / f"{session_id}.raw.mkv"
+    assert isinstance(path, Path)
+
+
+def test_raw_and_final_filenames_never_collide():
+    session_id = "20260912_143005_abcd1234"
+    assert build_output_filename(session_id) != build_raw_output_filename(session_id)

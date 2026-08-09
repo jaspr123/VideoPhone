@@ -37,6 +37,7 @@ from video_guestbook.media.audio_levels import (
 )
 from video_guestbook.media.mixer import MixerError, nudge_capture_gain
 from video_guestbook.media.recorder import Recorder, RecorderError
+from video_guestbook.media.transcode import TranscodeJob, TranscodeQueue
 from video_guestbook.media.validation import validate_recording
 from video_guestbook.state_machine import BoothState, StateMachine
 
@@ -134,6 +135,7 @@ class BoothApp:
         self.logger = logger
         self.state_machine = StateMachine(logger=logger)
         self.recorder = Recorder(config, logger=logger)
+        self.transcode_queue = TranscodeQueue(config, logger=logger)
         self.capture: cv2.VideoCapture | None = None
         self._last_frame = None
         self._countdown_deadline: float | None = None
@@ -367,13 +369,17 @@ class BoothApp:
             return
 
         self._session_log = get_session_adapter(self.logger, session.session_id)
-        self._session_log.info("recording started -> %s", session.output_path)
+        self._session_log.info(
+            "recording started -> %s%s",
+            session.live_output_path,
+            " (raw, will transcode after)" if session.needs_transcode else "",
+        )
         self._enter_state(BoothState.RECORDING)
 
     def _stop_and_save(self) -> None:
         self._enter_state(BoothState.SAVING)
         try:
-            output_path = self.recorder.stop()
+            session = self.recorder.stop()
         except RecorderError as exc:
             self.logger.error("failed to stop recording: %s", exc)
             self._last_result_reason = str(exc)
@@ -381,7 +387,7 @@ class BoothApp:
             self._enter_state(BoothState.ERROR)
             return
 
-        result = validate_recording(output_path)
+        result = validate_recording(session.live_output_path)
         # ffmpeg has exited either way; the camera is free again.
         self._reopen_camera_with_retry()
 
@@ -391,6 +397,17 @@ class BoothApp:
                 result.duration_seconds,
                 result.size_bytes,
             )
+            if session.needs_transcode:
+                self.transcode_queue.enqueue(
+                    TranscodeJob(
+                        session_id=session.session_id,
+                        raw_path=session.live_output_path,
+                        output_path=session.final_output_path,
+                    )
+                )
+                self._session_log.info(
+                    "queued for background transcode -> %s", session.final_output_path
+                )
             self._last_result_reason = "Message saved"
             self._enter_state(BoothState.SAVED)
         else:
@@ -487,6 +504,7 @@ class BoothApp:
     def run(self) -> None:
         self.open_camera()
         self.open_hook_switch()
+        self.transcode_queue.start()
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         try:
@@ -513,6 +531,7 @@ class BoothApp:
                 self.hook_switch.close()
             self.close_camera()
             cv2.destroyAllWindows()
+            self.transcode_queue.stop()
 
 
 def load_config(config_path: Path) -> BoothConfig:

@@ -148,14 +148,15 @@ def test_h264_input_copies_video(tmp_path):
     assert "-r" not in command
 
 
-def test_mjpeg_input_software_encodes_video(tmp_path):
-    """Cameras with no onboard H.264 (e.g. the Angetube): must re-encode.
+def test_mjpeg_input_fast_mode_software_encodes_video(tmp_path):
+    """Cameras with no onboard H.264 (e.g. the Angetube) in "fast" mode:
+    live software re-encode, immediately final but real CPU cost.
 
     Confirmed on real hardware: `v4l2-ctl -d /dev/video0 --list-formats-ext`
     on the Angetube only lists MJPG/YUYV, no H264 -- '-c:v copy' with no
     H.264 source stream fails outright.
     """
-    config = make_config(tmp_path, record_input_format="mjpeg")
+    config = make_config(tmp_path, record_input_format="mjpeg", recording_mode="fast")
     output_path = tmp_path / "recordings" / "session.mp4"
 
     command = ffmpeg_module.build_record_command(config, output_path)
@@ -166,3 +167,55 @@ def test_mjpeg_input_software_encodes_video(tmp_path):
     assert command[command.index("-r") + 1] == str(config.record_fps)
     # Still maps/encodes audio the same way regardless of video path.
     assert command[command.index("-c:a") + 1] == "aac"
+
+
+def test_mjpeg_input_quality_mode_copies_raw_video(tmp_path):
+    """Cameras with no onboard H.264 in "quality" mode (the default): the
+    live capture just copies raw MJPEG, near-zero CPU, no audio-dropout
+    risk. build_transcode_command() converts it to H.264 afterward."""
+    config = make_config(tmp_path, record_input_format="mjpeg", recording_mode="quality")
+    output_path = tmp_path / "recordings" / "session.raw.mkv"
+
+    command = ffmpeg_module.build_record_command(config, output_path)
+
+    assert command[command.index("-c:v") + 1] == "copy"
+    assert "libx264" not in command
+    assert "-r" not in command
+
+
+def test_is_live_video_copied(tmp_path):
+    assert ffmpeg_module.is_live_video_copied(
+        make_config(tmp_path, record_input_format="h264", recording_mode="fast")
+    )
+    assert ffmpeg_module.is_live_video_copied(
+        make_config(tmp_path, record_input_format="mjpeg", recording_mode="quality")
+    )
+    assert not ffmpeg_module.is_live_video_copied(
+        make_config(tmp_path, record_input_format="mjpeg", recording_mode="fast")
+    )
+
+
+def test_needs_deferred_transcode(tmp_path):
+    assert ffmpeg_module.needs_deferred_transcode(
+        make_config(tmp_path, record_input_format="mjpeg", recording_mode="quality")
+    )
+    assert not ffmpeg_module.needs_deferred_transcode(
+        make_config(tmp_path, record_input_format="mjpeg", recording_mode="fast")
+    )
+    assert not ffmpeg_module.needs_deferred_transcode(
+        make_config(tmp_path, record_input_format="h264", recording_mode="quality")
+    )
+
+
+def test_build_transcode_command(tmp_path):
+    config = make_config(tmp_path, record_input_format="mjpeg", recording_mode="quality")
+    raw_path = tmp_path / "recordings" / "session.raw.mkv"
+    output_path = tmp_path / "recordings" / "session.mp4"
+
+    command = ffmpeg_module.build_transcode_command(raw_path, output_path, config)
+
+    assert command[command.index("-i") + 1] == str(raw_path)
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert command[command.index("-c:a") + 1] == "copy"
+    assert command[command.index("-r") + 1] == str(config.record_fps)
+    assert command[-1] == str(output_path)

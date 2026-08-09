@@ -15,5 +15,6 @@
   "preview_fps": 20,
   "av_sync_offset_ms": 0,
   "hook_switch_enabled": true,
-  "hook_switch_gpio_pin": 17
+  "hook_switch_gpio_pin": 17,
+  "recording_mode": "quality"
 }

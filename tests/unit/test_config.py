@@ -49,6 +49,7 @@ def test_default_config_file_is_valid():
     assert config.av_sync_offset_ms == 0
     assert config.hook_switch_enabled is True
     assert config.hook_switch_gpio_pin == 17
+    assert config.recording_mode == "quality"
 
 
 def test_av_sync_offset_ms_defaults_to_zero_when_absent():
@@ -95,6 +96,23 @@ def test_hook_switch_gpio_pin_accepts_valid_range(pin):
 def test_hook_switch_gpio_pin_rejects_out_of_range_or_non_int(pin):
     with pytest.raises(ConfigError):
         BoothConfig.from_dict(valid_config_dict(hook_switch_gpio_pin=pin))
+
+
+def test_recording_mode_defaults_to_quality_when_absent():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.recording_mode == "quality"
+
+
+@pytest.mark.parametrize("mode", ["fast", "quality", "FAST", " Quality "])
+def test_recording_mode_accepts_valid_values_case_and_whitespace_insensitive(mode):
+    config = BoothConfig.from_dict(valid_config_dict(recording_mode=mode))
+    assert config.recording_mode == mode.strip().lower()
+
+
+@pytest.mark.parametrize("mode", ["slow", "live", "", 1])
+def test_recording_mode_rejects_invalid_values(mode):
+    with pytest.raises(ConfigError):
+        BoothConfig.from_dict(valid_config_dict(recording_mode=mode))
 
 
 def test_missing_key_raises():

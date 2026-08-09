@@ -15,6 +15,7 @@ from typing import Any
 _RESOLUTION_RE = re.compile(r"^(\d+)x(\d+)$")
 _BITRATE_RE = re.compile(r"^\d+k$")
 _VALID_INPUT_FORMATS = {"h264", "mjpeg"}
+_VALID_RECORDING_MODES = {"fast", "quality"}
 
 REQUIRED_KEYS = (
     "camera_device",
@@ -79,6 +80,16 @@ class BoothConfig:
     # regardless of this setting (architecture rule 11).
     hook_switch_enabled: bool = True
     hook_switch_gpio_pin: int = 17
+    # Only matters when record_input_format == "mjpeg" (a camera with no
+    # onboard H.264 -- see media/ffmpeg.py). "quality" (default) records the
+    # camera's raw MJPEG live (near-zero CPU, no audio-dropout risk) and
+    # transcodes to the final H.264 MP4 in the background after the guest
+    # hangs up. "fast" transcodes live instead, so the file is immediately
+    # final but competes with audio capture for CPU -- pick this only if a
+    # busy event risks backing up the background transcode queue. For
+    # cameras with real onboard H.264, this setting has no effect: -c:v copy
+    # is already both the fastest and highest-quality option.
+    recording_mode: str = "quality"
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -180,6 +191,13 @@ class BoothConfig:
                 f"got {hook_switch_gpio_pin!r}"
             )
 
+        recording_mode = str(data.get("recording_mode", "quality")).strip().lower()
+        if recording_mode not in _VALID_RECORDING_MODES:
+            raise ConfigError(
+                f"recording_mode must be one of {sorted(_VALID_RECORDING_MODES)}, "
+                f"got {recording_mode!r}"
+            )
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -198,6 +216,7 @@ class BoothConfig:
             av_sync_offset_ms=av_sync_offset_ms,
             hook_switch_enabled=hook_switch_enabled,
             hook_switch_gpio_pin=hook_switch_gpio_pin,
+            recording_mode=recording_mode,
         )
 
     @classmethod
