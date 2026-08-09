@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import threading
 import time
 from pathlib import Path
 
@@ -25,6 +26,15 @@ import numpy as np
 
 from video_guestbook.config import BoothConfig, ConfigError
 from video_guestbook.logging_setup import get_session_adapter, setup_logging
+from video_guestbook.media.audio_levels import (
+    STATUS_READY,
+    STATUS_SPEAK_CLOSER,
+    AudioLevelReader,
+    LevelReading,
+    MicrophoneError,
+    classify_level,
+)
+from video_guestbook.media.mixer import MixerError, nudge_capture_gain
 from video_guestbook.media.recorder import Recorder, RecorderError
 from video_guestbook.media.validation import validate_recording
 from video_guestbook.state_machine import BoothState, StateMachine
@@ -44,6 +54,13 @@ ERROR_DISPLAY_SECONDS = 4.0
 CAMERA_RELEASE_SETTLE_SECONDS = 0.25
 CAMERA_REOPEN_ATTEMPTS = 10
 CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.3
+
+# Countdown-time microphone check (PROJECT_SPEC.md section 6, "Proposed
+# countdown audio check"): sample level while the guest is getting ready,
+# then apply a single, one-shot capture-gain nudge before recording starts.
+# Per the spec, gain is NOT adjusted continuously once recording begins.
+MIC_CHECK_CHUNK_MS = 100
+MIC_GAIN_NUDGE_PERCENT = 15
 
 # States during which ffmpeg owns the camera device; the preview must not
 # touch it and instead shows the last frame captured before recording began.
@@ -79,6 +96,37 @@ def _draw_overlay(frame, text_lines: list[str], color=_TEXT_COLOR) -> None:
         y += 40
 
 
+_METER_FLOOR_DBFS = -60.0
+_METER_CEILING_DBFS = 0.0
+
+
+def _draw_mic_meter(frame, reading: LevelReading) -> None:
+    """Draw a live microphone level bar + status text (spec section 8)."""
+    height, width = frame.shape[:2]
+    bar_x, bar_y, bar_w, bar_h = 20, height - 60, width - 40, 20
+
+    cv2.putText(
+        frame,
+        reading.status,
+        (bar_x, bar_y - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        _TEXT_COLOR,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), _TEXT_COLOR, 1)
+
+    fraction = max(
+        0.0,
+        min(1.0, (reading.peak_dbfs - _METER_FLOOR_DBFS) / (_METER_CEILING_DBFS - _METER_FLOOR_DBFS)),
+    )
+    filled_w = int(bar_w * fraction)
+    if filled_w > 0:
+        fill_color = _RECORDING_COLOR if reading.clipped else _TEXT_COLOR
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + filled_w, bar_y + bar_h), fill_color, -1)
+
+
 class BoothApp:
     def __init__(self, config: BoothConfig, logger: logging.Logger) -> None:
         self.config = config
@@ -91,6 +139,12 @@ class BoothApp:
         self._state_entered_at: float = time.monotonic()
         self._last_result_reason: str = ""
         self._session_log = get_session_adapter(logger, "-")
+
+        self._mic_check_thread: threading.Thread | None = None
+        self._mic_check_stop_event = threading.Event()
+        self._mic_readings_lock = threading.Lock()
+        self._mic_readings: list[LevelReading] = []
+        self._latest_mic_reading: LevelReading | None = None
 
     def open_camera(self) -> None:
         self.capture = _configure_capture(self.config)
@@ -133,8 +187,111 @@ class BoothApp:
     def _start_countdown(self) -> None:
         self._enter_state(BoothState.COUNTDOWN)
         self._countdown_deadline = time.monotonic() + self.config.countdown_seconds
+        self._start_mic_check()
+
+    def _start_mic_check(self) -> None:
+        """Begin sampling mic level in the background during the countdown."""
+        if self._mic_check_thread is not None:
+            self._stop_mic_check()  # defensive: should not happen, but don't leak
+        with self._mic_readings_lock:
+            self._mic_readings = []
+            self._latest_mic_reading = None
+        self._mic_check_stop_event.clear()
+        self._mic_check_thread = threading.Thread(target=self._mic_check_loop, daemon=True)
+        self._mic_check_thread.start()
+
+    def _mic_check_loop(self) -> None:
+        reader = AudioLevelReader(
+            self.config.audio_device,
+            self.config.audio_sample_rate,
+            self.config.audio_channels,
+            chunk_ms=MIC_CHECK_CHUNK_MS,
+        )
+        try:
+            reader.start()
+        except MicrophoneError as exc:
+            self.logger.warning("countdown mic check could not start: %s", exc)
+            return
+        try:
+            while not self._mic_check_stop_event.is_set():
+                try:
+                    reading = reader.read()
+                except MicrophoneError as exc:
+                    self.logger.warning("countdown mic check stopped early: %s", exc)
+                    return
+                with self._mic_readings_lock:
+                    self._mic_readings.append(reading)
+                    self._latest_mic_reading = reading
+        finally:
+            reader.stop()
+
+    def _stop_mic_check(self) -> list[LevelReading]:
+        """Stop the background mic-check thread and return what it collected.
+
+        Blocks until the underlying arecord process has actually exited, so
+        the ALSA device is free again before ffmpeg tries to open it.
+        """
+        self._mic_check_stop_event.set()
+        if self._mic_check_thread is not None:
+            self._mic_check_thread.join(timeout=3.0)
+        self._mic_check_thread = None
+        with self._mic_readings_lock:
+            return list(self._mic_readings)
+
+    def _apply_mic_gain_nudge(self, readings: list[LevelReading]) -> None:
+        """One-shot capture-gain adjustment from the countdown-time check.
+
+        Never raises: a failure here (unknown mixer control, no card found,
+        etc) must not block recording, per architecture rule 17.
+        """
+        if not readings:
+            self.logger.debug("no mic readings collected during countdown; skipping gain nudge")
+            return
+
+        avg_rms = sum(r.rms_dbfs for r in readings) / len(readings)
+        avg_peak = sum(r.peak_dbfs for r in readings) / len(readings)
+        status = classify_level(avg_rms, avg_peak)
+
+        if status == STATUS_READY:
+            self.logger.info(
+                "countdown mic check: %s (avg rms=%.1f peak=%.1f dBFS), no gain change",
+                status,
+                avg_rms,
+                avg_peak,
+            )
+            return
+
+        delta = MIC_GAIN_NUDGE_PERCENT if status == STATUS_SPEAK_CLOSER else -MIC_GAIN_NUDGE_PERCENT
+        try:
+            result = nudge_capture_gain(self.config.audio_device, delta)
+        except MixerError as exc:
+            self.logger.warning(
+                "countdown mic check: %s (avg rms=%.1f peak=%.1f dBFS) but could not "
+                "adjust capture gain: %s",
+                status,
+                avg_rms,
+                avg_peak,
+                exc,
+            )
+            return
+
+        self.logger.info(
+            "countdown mic check: %s (avg rms=%.1f peak=%.1f dBFS) -> adjusted '%s' "
+            "capture from %d%% to %d%%",
+            status,
+            avg_rms,
+            avg_peak,
+            result.control,
+            result.old_percent,
+            result.new_percent,
+        )
 
     def _start_recording(self) -> None:
+        # Stop the countdown-time mic check and act on it before ffmpeg opens
+        # the audio device -- one process at a time, same as the camera.
+        readings = self._stop_mic_check()
+        self._apply_mic_gain_nudge(readings)
+
         # ffmpeg needs exclusive access to the camera device: release the
         # preview capture first and give the driver a moment to settle.
         self.close_camera()
@@ -227,6 +384,10 @@ class BoothApp:
         elif state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
             remaining = max(0, math.ceil(self._countdown_deadline - time.monotonic()))
             _draw_overlay(frame, [str(remaining) if remaining > 0 else "GO"])
+            with self._mic_readings_lock:
+                latest_mic_reading = self._latest_mic_reading
+            if latest_mic_reading is not None:
+                _draw_mic_meter(frame, latest_mic_reading)
         elif state == BoothState.RECORDING:
             elapsed = time.monotonic() - self._state_entered_at
             remaining = max(0, self.config.max_recording_seconds - int(elapsed))
@@ -279,6 +440,7 @@ class BoothApp:
                 if key != 0xFF:
                     running = self.handle_key(key)
         finally:
+            self._stop_mic_check()
             if self.recorder.is_running:
                 try:
                     self.recorder.stop()

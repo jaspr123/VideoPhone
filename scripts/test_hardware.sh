@@ -5,6 +5,7 @@
 #   - camera device exists
 #   - microphone ALSA device exists
 #   - ffmpeg and ffprobe are installed
+#   - amixer + a Mic/Capture control exist (for the automatic gain nudge)
 #   - the recordings output directory is writable
 #
 # Usage: scripts/test_hardware.sh [path-to-config.json]
@@ -109,7 +110,31 @@ else
     fail "arecord not found on PATH (install alsa-utils)"
 fi
 
-# 4. Output directory writable
+# 4. amixer + a Mic/Capture control on the configured card (needed for the
+#    countdown-time automatic gain nudge -- see media/mixer.py)
+CARD_IDX=""
+if [[ -n "$CARD_INDEX" ]]; then
+    CARD_IDX="$CARD_INDEX"
+elif [[ -n "$CARD_NAME" && -n "${ARECORD_OUTPUT:-}" ]]; then
+    CARD_IDX=$(echo "$ARECORD_OUTPUT" | grep -iE "^card [0-9]+: ${CARD_NAME}\b" | head -1 | sed -n 's/^card \([0-9]*\):.*/\1/p')
+fi
+
+if command -v amixer >/dev/null 2>&1; then
+    if [[ -n "$CARD_IDX" ]]; then
+        MIC_CONTROL=$(amixer -c "$CARD_IDX" scontrols 2>/dev/null | grep -oiE "'[^']*(mic|capture)[^']*'" | head -1 | tr -d "'")
+        if [[ -n "$MIC_CONTROL" ]]; then
+            pass "amixer found a Mic/Capture control on card $CARD_IDX: $MIC_CONTROL"
+        else
+            fail "amixer found no Mic/Capture-like control on card $CARD_IDX (automatic gain nudge will be skipped, recording still works)"
+        fi
+    else
+        fail "could not determine card index to check amixer controls"
+    fi
+else
+    fail "amixer not found on PATH (install alsa-utils; needed for automatic gain adjustment)"
+fi
+
+# 5. Output directory writable
 if [[ -n "$OUTPUT_DIR" ]]; then
     case "$OUTPUT_DIR" in
         /*) OUTPUT_DIR_ABS="$OUTPUT_DIR" ;;

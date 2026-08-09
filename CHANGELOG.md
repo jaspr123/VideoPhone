@@ -87,3 +87,33 @@
 - Documented how to check camera capability and choose the right
   `record_input_format` in the README ("Camera compatibility" section).
 - Added unit tests for both the `copy` and `libx264` encode paths.
+
+## Unreleased — Microphone level tooling and countdown-time gain check
+
+- Added `media/audio_levels.py`: reads raw PCM directly from `arecord` (no
+  numpy/sounddevice dependency) and computes RMS/peak dBFS per chunk,
+  classified into `MICROPHONE READY` / `SPEAK CLOSER` / `TOO LOUD - MOVE
+  SLIGHTLY AWAY` using the targets from PROJECT_SPEC.md section 6.
+- Added `media/mixer.py`: best-effort ALSA capture-gain discovery (the
+  Mic/Capture control name is resolved at runtime via `amixer scontrols`
+  rather than hardcoded, since it differs per USB audio adapter) and a
+  one-shot relative gain nudge. Never blocks recording on failure.
+- Added `scripts/mic_test.py`: standalone terminal level meter + timestamped
+  log file, no camera/video required. Flags clipping and possible dropouts
+  in real time. Uses the same level-analysis code as the app, so readings
+  match what the app itself sees. Written to help diagnose reported
+  feedback/cutting-out issues on the new microphone -- send the generated
+  log file for review.
+- Wired a countdown-time mic check into `main.py`: samples level in a
+  background thread while the countdown runs, shows a live meter + status
+  under the countdown number (spec section 8), and applies a single
+  ±15% capture-gain nudge right before recording starts based on the
+  average level seen -- never continuously during the recording itself
+  (spec section 6 explicitly warns against that). The mic-check `arecord`
+  process is fully stopped before ffmpeg opens the same ALSA device, same
+  handoff pattern as the camera.
+- Updated `scripts/test_hardware.sh` to also check `amixer` is installed
+  and that a Mic/Capture-like control exists on the configured device.
+- Added `tests/unit/test_audio_levels.py` and `tests/unit/test_mixer.py`
+  (dBFS math, classification thresholds, mocked `arecord`/`amixer`
+  subprocess behavior) -- 31 new tests, none require real hardware.

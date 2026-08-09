@@ -54,9 +54,12 @@ src/video_guestbook/        Application package
     ffmpeg.py                Centralized ffmpeg/ffprobe command construction
     recorder.py               Recording session lifecycle (start/stop)
     validation.py              Post-recording validation via ffprobe
+    audio_levels.py            Mic level sampling/classification (dBFS via arecord)
+    mixer.py                   ALSA capture-gain discovery + one-shot nudge
 scripts/
   install.sh                 System + Python dependency installer
-  test_hardware.sh            Camera/mic/ffmpeg/output-dir readiness check
+  test_hardware.sh            Camera/mic/amixer/ffmpeg/output-dir readiness check
+  mic_test.py                 Standalone mic level meter + log, no camera needed
 tests/unit/                 Automated unit tests (pytest)
 legacy/booth.py              Backup of the confirmed-working prototype (reference only)
 ```
@@ -213,6 +216,57 @@ not fixed by `av_sync_offset_ms`. If you see this, note how many seconds
 it drifts over how long a recording, and it'll need investigating on the
 actual hardware (e.g. re-encoding video to a constant frame rate instead
 of copying it, at a CPU cost).
+
+## Testing the microphone (`scripts/mic_test.py`)
+
+A standalone level meter and logger for diagnosing mic issues (feedback,
+clipping, dropouts, wrong gain) without needing the camera or the full
+app running:
+
+```bash
+python3 scripts/mic_test.py                     # uses config/booth.local.json (or booth.default.json)
+python3 scripts/mic_test.py --device plughw:3,0 --rate 48000 --channels 1
+python3 scripts/mic_test.py --seconds 30         # stop automatically after 30s
+```
+
+Ctrl+C to stop at any time. It shows a live bar meter and status
+(`MICROPHONE READY` / `SPEAK CLOSER` / `TOO LOUD - MOVE SLIGHTLY AWAY`,
+using the same thresholds as the app), flags clipping (`CLIP!`) and
+possible dropouts (audio going silent right after being active) in real
+time, and writes everything to a timestamped file under `logs/` (e.g.
+`logs/mic_test_20260101_120000.log`). **Send that log file along** if
+you're reporting an audio problem — it has timestamped RMS/peak dBFS,
+every clip event, and every possible dropout for the whole run.
+
+This uses the exact same level-analysis code
+(`video_guestbook.media.audio_levels`) as the app's countdown-time check
+below, so a reading you see here is what the app would also see.
+
+## Automatic countdown-time mic level check
+
+While the countdown is running, the app samples the microphone in the
+background (no extra wiring needed — this is always on) and shows the
+same live bar meter + status text under the countdown number. Right
+before recording starts, it takes the *average* level seen during the
+whole countdown and, if it wasn't in the good range, applies a **one-time**
+±15% nudge to the microphone's ALSA capture gain before ffmpeg opens the
+device — never continuously during the recording itself (PROJECT_SPEC.md
+section 6 explicitly warns against continuous gain changes mid-message,
+since it causes pumping/tone artifacts).
+
+This nudge is best-effort: the ALSA mixer control it needs to adjust
+(usually named something like `Mic` or `Capture`) is discovered at
+runtime via `amixer scontrols` rather than hardcoded, since every USB
+audio adapter names it differently. If no such control can be found, or
+`amixer` fails for any reason, the nudge is skipped and a warning is
+logged — recording is never blocked by this. Check `logs/booth.log` after
+a session for lines starting with `countdown mic check:` to see what it
+measured and whether/how it adjusted the gain.
+
+`scripts/test_hardware.sh` now also checks that `amixer` is installed and
+that a Mic/Capture-like control exists on your configured audio device,
+so you'll know ahead of time whether the automatic nudge will be able to
+do anything.
 
 ## Logs
 
