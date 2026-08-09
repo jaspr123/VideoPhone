@@ -260,17 +260,21 @@ back after setting, so there's no ambiguity about what's configured. Pair
 this with `scripts/mic_test.py`: set a level, run the test, check the clip
 count, adjust, repeat.
 
-> **Combined Playback/Capture controls:** some USB audio adapters expose a
-> "Mic" control with *two different levels bundled under one name* — a
-> Playback/monitoring level (visible in `alsamixer`'s `F3` view) and the
-> actual Capture level that recording uses (visible in `F4`). These can
-> read very differently (e.g. Playback at 87% while Capture sits at 7%).
-> `mic_gain.py` and the app both always read/report the **Capture** line
-> specifically — if you're checking by hand in `alsamixer`, make sure
-> you're looking at the `F4` (Capture) view, not `F3` (Playback), or the
-> number won't match what's actually feeding the recording. Use
-> `--raw`/`--set` on `mic_gain.py` to see the full `amixer` output and
-> confirm which line actually moved.
+> **Combined Playback/Capture controls:** confirmed on real hardware — this
+> device's "Mic" control bundles *two different levels under one name*: a
+> Playback/monitoring (sidetone) level (visible in `alsamixer`'s `F3` view)
+> and the actual Capture level that recording uses (visible in `F4`), and
+> they can read very differently (e.g. Playback at 7% while Capture sits
+> at 79%). `mic_gain.py` and the app always read/report the **Capture**
+> line specifically — if you're checking by hand in `alsamixer`, make sure
+> you're on the `F4` (Capture) view, not `F3` (Playback), or the number
+> won't match what's feeding the recording.
+>
+> Also confirmed: `amixer sset` on this device moves **both** elements
+> together (no reliable way around that in alsa-utils). That's harmless
+> here since nothing in this app uses mic sidetone/monitoring — only the
+> Capture side matters for what actually gets recorded. Use `--raw` on
+> `mic_gain.py` if you ever need to double-check both lines yourself.
 
 ## Automatic countdown-time mic level check
 

@@ -154,14 +154,15 @@ def get_capture_percent(card_index: int, control: str) -> int:
 def set_capture_percent(card_index: int, control: str, percent: int) -> None:
     """Set a control's Capture volume.
 
-    CAVEAT (unverified on real hardware): for a combined control that has
-    both Playback and Capture volume elements (see get_capture_percent's
-    docstring), plain `amixer sset NAME VALUE%` may set BOTH elements to
-    the same value rather than Capture alone -- alsa-utils' CLI does not
-    have a universally reliable "capture only" qualifier across versions.
-    Callers that care whether the Playback/monitoring level was also
-    changed should call get_raw_control_info() before and after and
-    compare, rather than trusting this blindly.
+    CONFIRMED on real hardware (a combined 'Mic' control with both Playback
+    and Capture elements): plain `amixer sset NAME VALUE%` sets BOTH
+    elements to approximately the same percentage -- alsa-utils' CLI has no
+    reliable "capture only" qualifier across versions, so there's no clean
+    way to touch just one via `sset`. For this project this is harmless:
+    nothing uses mic sidetone/monitoring (the Playback element's usual
+    purpose), only the actual recording, which reads the Capture element.
+    If a future device's Playback element *does* matter, verify with
+    get_raw_control_info() before/after rather than assuming.
     """
     percent = max(0, min(100, percent))
     amixer = find_amixer()
