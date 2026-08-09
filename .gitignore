@@ -6,3 +6,4 @@ __pycache__/
 recordings/*.mp4
 logs/*.log
 logs/*.log.*
+config/booth.local.json

@@ -114,10 +114,29 @@ Escape   -> quit the app
 
 ## Configuration
 
-Edit `config/booth.default.json` (or supply `--config`) to change camera
-device, resolution, frame rate, audio device, countdown duration, and
-maximum recording length. All fields are validated on load; the app refuses
-to start with an invalid configuration and prints the reason.
+`config/booth.default.json` is a **tracked file with generic defaults** —
+treat it the same as any other source file: don't hand-edit it on a
+deployed Pi, because a future `git pull` will conflict with your local
+changes.
+
+For device-specific values (`camera_device`, `audio_device`,
+`av_sync_offset_ms`, and anything else particular to one Pi/camera/mic),
+make a **local, untracked copy** instead:
+
+```bash
+cp config/booth.default.json config/booth.local.json
+```
+
+`config/booth.local.json` is gitignored, so it's yours to edit freely and
+`git pull` will never touch it. Run the app against it:
+
+```bash
+python3 -m video_guestbook.main --config config/booth.local.json
+```
+
+(and pass the same path to `scripts/test_hardware.sh config/booth.local.json`).
+All fields are validated on load either way; the app refuses to start with
+an invalid configuration and prints the reason.
 
 Key fields:
 
