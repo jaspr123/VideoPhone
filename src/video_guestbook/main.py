@@ -1,9 +1,9 @@
 """Guest-facing booth application entry point.
 
-Milestone 1 scope only: full-screen MJPEG preview, Spacebar start/stop,
-countdown, recording via ffmpeg, save validation, and return to READY.
-Hook-switch, themes, admin UI and cloud sync are intentionally not
-implemented yet (see PROJECT_SPEC.md section 23).
+Full-screen MJPEG preview, hook-switch AND Spacebar start/stop (both work
+at once per architecture rule 11), countdown, recording via ffmpeg, save
+validation, and return to READY. Themes, admin UI and cloud sync are
+intentionally not implemented yet (see PROJECT_SPEC.md section 23).
 
 Camera/ffmpeg handoff: the USB webcam can only be held open by one process
 at a time. This mirrors the confirmed working prototype (legacy/booth.py):
@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 
 from video_guestbook.config import BoothConfig, ConfigError
+from video_guestbook.hardware.hook_switch import HookSwitch, HookSwitchError
 from video_guestbook.logging_setup import get_session_adapter, setup_logging
 from video_guestbook.media.audio_levels import (
     STATUS_READY,
@@ -146,6 +147,56 @@ class BoothApp:
         self._mic_readings: list[LevelReading] = []
         self._latest_mic_reading: LevelReading | None = None
 
+        self.hook_switch: HookSwitch | None = None
+        self._hook_switch_was_lifted = False
+
+    def open_hook_switch(self) -> None:
+        """Best-effort: missing/failed GPIO must not crash the app (rule 17).
+
+        Spacebar remains fully functional either way (architecture rule 11).
+        """
+        if not self.config.hook_switch_enabled:
+            self.logger.info("hook switch disabled in config; Spacebar only")
+            return
+        try:
+            self.hook_switch = HookSwitch(
+                pin=self.config.hook_switch_gpio_pin, logger=self.logger
+            )
+            self.logger.info(
+                "hook switch initialized on GPIO%d", self.config.hook_switch_gpio_pin
+            )
+        except HookSwitchError as exc:
+            self.logger.warning(
+                "hook switch unavailable (%s); falling back to Spacebar only", exc
+            )
+            self.hook_switch = None
+
+    def _poll_hook_switch(self) -> None:
+        if self.hook_switch is None:
+            return
+
+        try:
+            lifted = self.hook_switch.is_lifted
+        except HookSwitchError as exc:
+            self.logger.warning("hook switch read failed, disabling: %s", exc)
+            self.hook_switch = None
+            return
+
+        just_lifted = lifted and not self._hook_switch_was_lifted
+        just_replaced = (not lifted) and self._hook_switch_was_lifted
+        self._hook_switch_was_lifted = lifted
+
+        state = self.state_machine.state
+        if just_lifted and state == BoothState.READY:
+            self.logger.info("hook switch: receiver lifted")
+            self._start_countdown()
+        elif just_replaced and state == BoothState.RECORDING:
+            self.logger.info("hook switch: receiver replaced")
+            self._stop_and_save()
+        elif just_replaced and state == BoothState.COUNTDOWN:
+            self.logger.info("hook switch: receiver replaced during countdown, cancelling")
+            self._cancel_countdown()
+
     def open_camera(self) -> None:
         self.capture = _configure_capture(self.config)
         if not self.capture.isOpened():
@@ -188,6 +239,15 @@ class BoothApp:
         self._enter_state(BoothState.COUNTDOWN)
         self._countdown_deadline = time.monotonic() + self.config.countdown_seconds
         self._start_mic_check()
+
+    def _cancel_countdown(self) -> None:
+        """Receiver replaced before the countdown finished -- spec section 20
+        explicitly lists "receiver lifted and immediately replaced" as a
+        venue-simulation test case. No recording was started, so just
+        return to READY without touching the recorder."""
+        self._stop_mic_check()
+        self._countdown_deadline = None
+        self._enter_state(BoothState.READY)
 
     def _start_mic_check(self) -> None:
         """Begin sampling mic level in the background during the countdown."""
@@ -359,6 +419,8 @@ class BoothApp:
 
     def tick(self) -> None:
         """Advance time-based transitions (countdown expiry, auto-stop, timeouts)."""
+        self._poll_hook_switch()
+
         state = self.state_machine.state
 
         if state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
@@ -424,6 +486,7 @@ class BoothApp:
 
     def run(self) -> None:
         self.open_camera()
+        self.open_hook_switch()
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         try:
@@ -446,6 +509,8 @@ class BoothApp:
                     self.recorder.stop()
                 except RecorderError:
                     self.logger.exception("failed to stop recorder during shutdown")
+            if self.hook_switch is not None:
+                self.hook_switch.close()
             self.close_camera()
             cv2.destroyAllWindows()
 

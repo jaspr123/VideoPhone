@@ -150,3 +150,38 @@
 - Added regression tests in `test_mixer.py` using a combined
   Playback+Capture fixture with deliberately different percentages, plus
   tests for `get_raw_control_info` and the "no Capture element" case.
+
+## Unreleased — Milestone 2: physical hook-switch integration
+
+- Added `hardware/hook_switch.py`: GPIO17 primary receiver-state signal
+  (internal pull-up, active-low) via `gpiozero.Button`, with hardware
+  debouncing (~150ms) so brief mechanical bounce during the switch's
+  travel is filtered out. GPIO27 is read only for diagnostics
+  (`diagnostic_is_active`), matching PROJECT_SPEC.md section 4's caution
+  that it "should be treated as diagnostic until the switch is re-tested."
+  `gpiozero` is imported lazily and defensively so the module (and the
+  rest of the app) still loads/tests fine without it installed.
+- Wired into `main.py`: polled once per tick, edge-triggered (lift ->
+  start countdown from READY; hang up -> stop and save from RECORDING;
+  hang up during COUNTDOWN -> cancel back to READY, per the spec's
+  section 20 venue-simulation test case "receiver lifted and immediately
+  replaced"). Spacebar keeps working identically and simultaneously
+  (architecture rule 11) -- this is not a replacement, both inputs drive
+  the same state machine.
+- If the GPIO pin can't be claimed at startup (not wired, `gpiozero`/
+  backend not installed, pin in use), `open_hook_switch()` catches the
+  failure, logs a warning, and the app runs Spacebar-only rather than
+  crashing (architecture rule 17).
+- Added `hook_switch_enabled` (default `true`) and `hook_switch_gpio_pin`
+  (default `17`) to booth configuration, both optional so existing
+  configs keep working unchanged.
+- Added `gpiozero` and `lgpio` to `requirements.txt`; `install.sh` now
+  notes the `python3-lgpio` apt fallback if the pip wheel doesn't build,
+  and the `gpio` group requirement.
+- `scripts/test_hardware.sh` now checks `gpiozero` is importable and that
+  the configured GPIO pin can be claimed (does not simulate an actual
+  lift/hang-up -- that still needs a real test on the Pi).
+- Added `tests/unit/test_hook_switch.py` (10 tests, using a fake
+  `gpiozero.Button` monkeypatched at the module level so these run
+  without `gpiozero` installed or real GPIO hardware) and config
+  validation tests for the two new fields.

@@ -3,27 +3,29 @@
 A Raspberry Pi video guestbook phone application. See [PROJECT_SPEC.md](PROJECT_SPEC.md)
 for the full project specification.
 
-## Milestone 1 scope
+## Scope
 
-This repository currently implements **Milestone 1 only**, per
-[PROJECT_SPEC.md section 23](PROJECT_SPEC.md#23-implementation-prompt-for-codex-or-claude-code):
+This repository implements **Milestone 1** in full, per
+[PROJECT_SPEC.md section 23](PROJECT_SPEC.md#23-implementation-prompt-for-codex-or-claude-code),
+plus hook-switch integration from **Milestone 2**:
 
 - Clean Python package structure (`src/video_guestbook/`)
 - Configuration moved into a validated JSON file (`config/booth.default.json`)
 - MJPEG live preview via OpenCV, full-screen window
-- 1280x720 @ 30 fps H.264 recording (video copied straight from the webcam)
-- USB microphone recording via the stable ALSA device `plughw:CARD=Device,DEV=0`
+- 1280x720 @ 30 fps H.264 recording (copied straight from the webcam when it
+  has onboard H.264, software-encoded otherwise -- see "Camera compatibility" below)
+- USB microphone recording via a configurable ALSA device
 - AAC audio, MP4 output
 - Graceful FFmpeg stop via stdin `q`
-- Spacebar start/stop, `q`/`Esc` to quit
+- **Physical receiver hook switch** (lift to start, hang up to stop/save) AND
+  Spacebar both work at the same time; `q`/`Esc` to quit
 - `READY`, `COUNTDOWN`, `RECORDING`, `SAVING`, `SAVED`, `ERROR` states
 - Detailed rotating logs (`logs/booth.log`)
 - Automated unit tests (state transitions, filenames, config validation, recording validation)
 - A hardware readiness script (`scripts/test_hardware.sh`)
 
-Google Drive sync, themes, the admin UI and hook-switch integration are **out of
-scope** for this milestone and are not implemented (see later milestones in
-PROJECT_SPEC.md).
+Google Drive sync, themes, and the admin UI are **out of scope** for now and
+are not implemented (see later milestones in PROJECT_SPEC.md).
 
 > **Note:** [`legacy/booth.py`](legacy/booth.py) is a verbatim backup of the
 > confirmed-working prototype from `~/video-booth/app/booth.py`, tested on the
@@ -49,7 +51,9 @@ src/video_guestbook/        Application package
   config.py                 Config loading/validation
   state_machine.py          Booth state machine
   logging_setup.py          Rotating file + console logging
-  main.py                   Guest UI loop (OpenCV preview, Spacebar control)
+  main.py                   Guest UI loop (OpenCV preview, hook switch + Spacebar control)
+  hardware/
+    hook_switch.py            GPIO receiver hook switch (gpiozero), debounced
   media/
     ffmpeg.py                Centralized ffmpeg/ffprobe command construction
     recorder.py               Recording session lifecycle (start/stop)
@@ -111,10 +115,18 @@ python3 -m video_guestbook.main --config /path/to/custom.json
 ### Guest controls
 
 ```text
-Spacebar -> start recording (from READY) / stop and save (from RECORDING)
-Q        -> quit the app
-Escape   -> quit the app
+Hook switch (lift)   -> start countdown, then recording (from READY)
+Hook switch (hang up) -> stop and save (from RECORDING), or cancel (from COUNTDOWN)
+Spacebar              -> same as lifting/hanging up, works at the same time as the hook switch
+Q / Escape            -> quit the app
 ```
+
+The physical hook switch and Spacebar both work simultaneously (architecture
+rule 11) -- Spacebar is a permanent backup, not just a development stand-in.
+If the hook switch's GPIO can't be claimed at startup (not wired, `gpiozero`
+missing, pin already in use), the app logs a warning and falls back to
+Spacebar-only rather than crashing; check `logs/booth.log` for `hook switch`
+lines to see what happened.
 
 ## Configuration
 
@@ -159,6 +171,8 @@ Key fields:
 | `output_dir` / `log_dir` | Paths relative to the repository root               |
 | `preview_resolution` / `preview_fps` | Live preview quality (independent of recording quality) |
 | `av_sync_offset_ms`      | Manual A/V sync correction, in milliseconds. `0` = no correction (default). See "Fixing audio/video sync" below. |
+| `hook_switch_enabled`    | `true` (default) to use the physical receiver switch; `false` for Spacebar-only |
+| `hook_switch_gpio_pin`   | BCM GPIO pin number for the primary hook-switch signal (default `17`, per PROJECT_SPEC.md section 4) |
 
 ## Camera compatibility (H.264 vs MJPEG)
 
@@ -301,6 +315,43 @@ measured and whether/how it adjusted the gain.
 that a Mic/Capture-like control exists on your configured audio device,
 so you'll know ahead of time whether the automatic nudge will be able to
 do anything.
+
+## Hook switch (physical receiver)
+
+Wiring, per PROJECT_SPEC.md section 4 (never wire the switch to 5V or 3.3V):
+
+```text
+Black wire -> physical pin 9  -> GND
+Red wire   -> physical pin 11 -> GPIO17
+Green wire -> physical pin 13 -> GPIO27
+```
+
+Lifting the receiver starts the countdown (from `READY`); hanging up stops
+and saves (from `RECORDING`), or cancels back to `READY` if the receiver
+goes back on the hook before the countdown finishes. Spacebar keeps working
+identically at the same time -- it's a permanent backup, not just a dev
+tool.
+
+- **GPIO17** is the primary signal (stable LOW = lifted, stable HIGH =
+  on-hook, using the GPIO's internal pull-up). Debouncing (~150ms) is
+  handled by `gpiozero`'s `Button` class, so brief mechanical bounce during
+  the switch's travel is filtered out automatically.
+- **GPIO27** was observed to stay low regardless of hook state during
+  initial testing and is read only for diagnostics (available via
+  `HookSwitch.diagnostic_is_active` if you're debugging wiring), never used
+  for start/stop logic.
+- If the GPIO can't be claimed at startup (not wired, `gpiozero`/`lgpio`
+  not installed, pin already in use by something else), the app logs a
+  warning and runs Spacebar-only rather than crashing. Check
+  `logs/booth.log` for `hook switch` lines.
+- `hook_switch_enabled: false` in config disables it entirely (Spacebar
+  only), and `hook_switch_gpio_pin` lets you use a different BCM pin if
+  your wiring differs.
+
+`scripts/test_hardware.sh` checks that `gpiozero` is importable and that
+the configured GPIO pin can be claimed, but that only proves the software
+side is ready -- it does **not** simulate lifting the receiver. Confirm the
+real thing works by running the app and physically lifting/hanging up.
 
 ## Logs
 

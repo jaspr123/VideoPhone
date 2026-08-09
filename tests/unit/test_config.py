@@ -47,6 +47,8 @@ def test_default_config_file_is_valid():
     assert config.audio_device == "plughw:CARD=Device,DEV=0"
     assert config.max_recording_seconds == 90
     assert config.av_sync_offset_ms == 0
+    assert config.hook_switch_enabled is True
+    assert config.hook_switch_gpio_pin == 17
 
 
 def test_av_sync_offset_ms_defaults_to_zero_when_absent():
@@ -64,6 +66,35 @@ def test_av_sync_offset_ms_accepts_values_in_range(offset):
 def test_av_sync_offset_ms_rejects_out_of_range_or_non_int(offset):
     with pytest.raises(ConfigError):
         BoothConfig.from_dict(valid_config_dict(av_sync_offset_ms=offset))
+
+
+def test_hook_switch_defaults_when_absent():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.hook_switch_enabled is True
+    assert config.hook_switch_gpio_pin == 17
+
+
+def test_hook_switch_enabled_can_be_disabled():
+    config = BoothConfig.from_dict(valid_config_dict(hook_switch_enabled=False))
+    assert config.hook_switch_enabled is False
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", None])
+def test_hook_switch_enabled_rejects_non_bool(value):
+    with pytest.raises(ConfigError):
+        BoothConfig.from_dict(valid_config_dict(hook_switch_enabled=value))
+
+
+@pytest.mark.parametrize("pin", [0, 2, 17, 27])
+def test_hook_switch_gpio_pin_accepts_valid_range(pin):
+    config = BoothConfig.from_dict(valid_config_dict(hook_switch_gpio_pin=pin))
+    assert config.hook_switch_gpio_pin == pin
+
+
+@pytest.mark.parametrize("pin", [-1, 28, 17.5, "17"])
+def test_hook_switch_gpio_pin_rejects_out_of_range_or_non_int(pin):
+    with pytest.raises(ConfigError):
+        BoothConfig.from_dict(valid_config_dict(hook_switch_gpio_pin=pin))
 
 
 def test_missing_key_raises():

@@ -6,6 +6,7 @@
 #   - microphone ALSA device exists
 #   - ffmpeg and ffprobe are installed
 #   - amixer + a Mic/Capture control exist (for the automatic gain nudge)
+#   - gpiozero is importable, if the hook switch is enabled
 #   - the recordings output directory is writable
 #
 # Usage: scripts/test_hardware.sh [path-to-config.json]
@@ -46,16 +47,22 @@ with open(sys.argv[1], encoding="utf-8") as f:
 print(data.get("camera_device", ""))
 print(data.get("audio_device", ""))
 print(data.get("output_dir", ""))
+print(data.get("hook_switch_enabled", True))
+print(data.get("hook_switch_gpio_pin", 17))
 PYEOF
 )
 CAMERA_DEVICE="${CONFIG_VALUES[0]:-}"
 AUDIO_DEVICE="${CONFIG_VALUES[1]:-}"
 OUTPUT_DIR="${CONFIG_VALUES[2]:-}"
+HOOK_SWITCH_ENABLED="${CONFIG_VALUES[3]:-True}"
+HOOK_SWITCH_GPIO_PIN="${CONFIG_VALUES[4]:-17}"
 
 echo "Using config: $CONFIG_PATH"
-echo "  camera_device = $CAMERA_DEVICE"
-echo "  audio_device  = $AUDIO_DEVICE"
-echo "  output_dir    = $OUTPUT_DIR"
+echo "  camera_device        = $CAMERA_DEVICE"
+echo "  audio_device         = $AUDIO_DEVICE"
+echo "  output_dir           = $OUTPUT_DIR"
+echo "  hook_switch_enabled  = $HOOK_SWITCH_ENABLED"
+echo "  hook_switch_gpio_pin = $HOOK_SWITCH_GPIO_PIN"
 echo ""
 
 # 1. ffmpeg / ffprobe present
@@ -134,7 +141,37 @@ else
     fail "amixer not found on PATH (install alsa-utils; needed for automatic gain adjustment)"
 fi
 
-# 5. Output directory writable
+# 5. Hook switch (gpiozero). Only checked if enabled in config -- this
+#    confirms the library and GPIO pin can be claimed, NOT that lifting the
+#    receiver is actually wired correctly. Verify that by running the app
+#    and lifting/replacing the receiver for real.
+if [[ "$HOOK_SWITCH_ENABLED" == "True" || "$HOOK_SWITCH_ENABLED" == "true" ]]; then
+    if python3 -c "import gpiozero" >/dev/null 2>&1; then
+        pass "gpiozero importable"
+        GPIO_TEST_OUTPUT=$(python3 - "$HOOK_SWITCH_GPIO_PIN" <<'PYEOF' 2>&1
+import sys
+try:
+    from gpiozero import Button
+    button = Button(int(sys.argv[1]), pull_up=True)
+    button.close()
+    print("OK")
+except Exception as exc:
+    print(f"FAIL: {exc}")
+PYEOF
+)
+        if [[ "$GPIO_TEST_OUTPUT" == "OK" ]]; then
+            pass "GPIO$HOOK_SWITCH_GPIO_PIN claimable (hook switch pin)"
+        else
+            fail "could not claim GPIO$HOOK_SWITCH_GPIO_PIN: $GPIO_TEST_OUTPUT"
+        fi
+    else
+        fail "gpiozero not importable (pip install gpiozero lgpio; app falls back to Spacebar-only)"
+    fi
+else
+    echo "[SKIP] hook switch disabled in config (hook_switch_enabled=false)"
+fi
+
+# 6. Output directory writable
 if [[ -n "$OUTPUT_DIR" ]]; then
     case "$OUTPUT_DIR" in
         /*) OUTPUT_DIR_ABS="$OUTPUT_DIR" ;;

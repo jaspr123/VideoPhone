@@ -72,6 +72,13 @@ class BoothConfig:
     # delays audio relative to video (use when audio is ahead / plays too
     # early). Optional; defaults to 0 (no correction) for existing configs.
     av_sync_offset_ms: int = 0
+    # Physical receiver hook switch (PROJECT_SPEC.md section 4). GPIO17 is
+    # the primary signal per the spec; the diagnostic GPIO27 pin is not
+    # configurable (see hardware/hook_switch.py). Optional; defaults keep
+    # existing configs working. Spacebar always remains a backup input
+    # regardless of this setting (architecture rule 11).
+    hook_switch_enabled: bool = True
+    hook_switch_gpio_pin: int = 17
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -160,6 +167,19 @@ class BoothConfig:
                 f"got {av_sync_offset_ms!r}"
             )
 
+        hook_switch_enabled = data.get("hook_switch_enabled", True)
+        if not isinstance(hook_switch_enabled, bool):
+            raise ConfigError(
+                f"hook_switch_enabled must be a boolean, got {hook_switch_enabled!r}"
+            )
+
+        hook_switch_gpio_pin = data.get("hook_switch_gpio_pin", 17)
+        if not isinstance(hook_switch_gpio_pin, int) or not (0 <= hook_switch_gpio_pin <= 27):
+            raise ConfigError(
+                "hook_switch_gpio_pin must be an integer between 0 and 27, "
+                f"got {hook_switch_gpio_pin!r}"
+            )
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -176,6 +196,8 @@ class BoothConfig:
             preview_resolution=str(data["preview_resolution"]).strip(),
             preview_fps=preview_fps,
             av_sync_offset_ms=av_sync_offset_ms,
+            hook_switch_enabled=hook_switch_enabled,
+            hook_switch_gpio_pin=hook_switch_gpio_pin,
         )
 
     @classmethod
