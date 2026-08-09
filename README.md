@@ -60,6 +60,7 @@ scripts/
   install.sh                 System + Python dependency installer
   test_hardware.sh            Camera/mic/amixer/ffmpeg/output-dir readiness check
   mic_test.py                 Standalone mic level meter + log, no camera needed
+  mic_gain.py                  Show/set exact ALSA capture gain (no alsamixer TUI)
 tests/unit/                 Automated unit tests (pytest)
 legacy/booth.py              Backup of the confirmed-working prototype (reference only)
 ```
@@ -241,6 +242,23 @@ every clip event, and every possible dropout for the whole run.
 This uses the exact same level-analysis code
 (`video_guestbook.media.audio_levels`) as the app's countdown-time check
 below, so a reading you see here is what the app would also see.
+
+## Setting the microphone gain precisely (`scripts/mic_gain.py`)
+
+`alsamixer`'s TUI works, but it's easy to fumble or forget whether a change
+actually took (and whether it survived a reboot). For a precise, scriptable
+alternative:
+
+```bash
+python3 scripts/mic_gain.py                 # show current card/control/level, no changes
+python3 scripts/mic_gain.py --set 40         # set capture level to exactly 40%
+python3 scripts/mic_gain.py --set 40 --persist   # also run 'sudo alsactl store'
+```
+
+It reports back the control name it found and the level it actually read
+back after setting, so there's no ambiguity about what's configured. Pair
+this with `scripts/mic_test.py`: set a level, run the test, check the clip
+count, adjust, repeat.
 
 ## Automatic countdown-time mic level check
 

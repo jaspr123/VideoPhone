@@ -117,3 +117,11 @@
 - Added `tests/unit/test_audio_levels.py` and `tests/unit/test_mixer.py`
   (dBFS math, classification thresholds, mocked `arecord`/`amixer`
   subprocess behavior) -- 31 new tests, none require real hardware.
+
+## Unreleased — Precise mic gain CLI
+
+- Added `scripts/mic_gain.py`: shows/sets the microphone's exact ALSA
+  capture percentage via `media/mixer.py`, with an optional `--persist`
+  to run `alsactl store`. Written during live gain-tuning on real
+  hardware where `alsamixer`'s TUI made it hard to confirm whether a
+  change actually took effect between test runs.
