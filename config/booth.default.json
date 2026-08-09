@@ -2,7 +2,7 @@
   "camera_device": "/dev/video0",
   "record_resolution": "1280x720",
   "record_fps": 30,
-  "record_input_format": "h264",
+  "record_input_format": "mjpeg",
   "audio_device": "plughw:CARD=Device,DEV=0",
   "audio_sample_rate": 48000,
   "audio_channels": 1,

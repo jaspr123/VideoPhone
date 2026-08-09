@@ -126,7 +126,7 @@ Key fields:
 | `camera_device`         | v4l2 device path, e.g. `/dev/video0`                |
 | `record_resolution`     | `WIDTHxHEIGHT`, e.g. `1280x720`                     |
 | `record_fps`             | Recording frame rate (1-60)                         |
-| `record_input_format`    | `h264` or `mjpeg` (camera capture mode)             |
+| `record_input_format`    | `h264` (copy, no CPU cost) or `mjpeg` (software re-encode, real CPU cost). See "Camera compatibility" below. |
 | `audio_device`           | Stable ALSA identifier, e.g. `plughw:CARD=Device,DEV=0` |
 | `audio_sample_rate`      | 8000/16000/22050/32000/44100/48000                  |
 | `audio_channels`         | 1 (mono) or 2 (stereo)                              |
@@ -136,6 +136,33 @@ Key fields:
 | `output_dir` / `log_dir` | Paths relative to the repository root               |
 | `preview_resolution` / `preview_fps` | Live preview quality (independent of recording quality) |
 | `av_sync_offset_ms`      | Manual A/V sync correction, in milliseconds. `0` = no correction (default). See "Fixing audio/video sync" below. |
+
+## Camera compatibility (H.264 vs MJPEG)
+
+Not every USB webcam has an onboard H.264 encoder. Before assuming
+`record_input_format: "h264"` will work, check what your camera actually
+offers:
+
+```bash
+v4l2-ctl -d /dev/video0 --list-formats-ext
+```
+
+- **If `H264` is listed** for your target resolution/fps: set
+  `record_input_format: "h264"`. The camera's H.264 bitstream is copied
+  straight into the MP4 with zero CPU cost (this is the original design,
+  per PROJECT_SPEC.md section 16).
+- **If only `MJPG`/`YUYV` are listed** (no `H264`): set
+  `record_input_format: "mjpeg"`. Video is then software-encoded to H.264
+  on the Pi's CPU (`libx264`, `ultrafast` preset, ~4 Mbps) instead of
+  copied. This has **not** been verified to hold 1280x720@30fps in real
+  time on a Pi 4 — test it with a real recording and watch for dropped
+  frames or preview lag. If it can't keep up, try a lower
+  `record_resolution` or `record_fps` before anything else.
+
+Setting `record_input_format` to a value the camera doesn't actually
+support (e.g. `h264` on a camera with no H.264 output) will fail to start
+recording — this is the single most common cause of "the app won't
+record" after swapping cameras.
 
 ## Fixing audio/video sync
 

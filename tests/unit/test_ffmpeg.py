@@ -134,3 +134,35 @@ def test_negative_sync_offset_delays_audio_input(tmp_path):
     # before the audio -i.
     assert camera_device_index < itsoffset_index < audio_device_index
     assert command[itsoffset_index + 1] == "0.200"
+
+
+def test_h264_input_copies_video(tmp_path):
+    """Cameras with onboard H.264 (e.g. the original webcam): no re-encode."""
+    config = make_config(tmp_path, record_input_format="h264")
+    output_path = tmp_path / "recordings" / "session.mp4"
+
+    command = ffmpeg_module.build_record_command(config, output_path)
+
+    assert command[command.index("-c:v") + 1] == "copy"
+    assert "libx264" not in command
+    assert "-r" not in command
+
+
+def test_mjpeg_input_software_encodes_video(tmp_path):
+    """Cameras with no onboard H.264 (e.g. the Angetube): must re-encode.
+
+    Confirmed on real hardware: `v4l2-ctl -d /dev/video0 --list-formats-ext`
+    on the Angetube only lists MJPG/YUYV, no H264 -- '-c:v copy' with no
+    H.264 source stream fails outright.
+    """
+    config = make_config(tmp_path, record_input_format="mjpeg")
+    output_path = tmp_path / "recordings" / "session.mp4"
+
+    command = ffmpeg_module.build_record_command(config, output_path)
+
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert "-preset" in command
+    assert command[command.index("-pix_fmt") + 1] == "yuv420p"
+    assert command[command.index("-r") + 1] == str(config.record_fps)
+    # Still maps/encodes audio the same way regardless of video path.
+    assert command[command.index("-c:a") + 1] == "aac"

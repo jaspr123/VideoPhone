@@ -67,3 +67,23 @@
   does not fix.
 - Added unit tests for the new config field and for where `-itsoffset` is
   inserted in the ffmpeg command for positive/negative/zero offsets.
+
+## Unreleased — Software H.264 encode fallback for cameras with no onboard encoder
+
+- Root cause found for "the app won't record" after swapping to a new
+  camera (Angetube 4K webcam): `v4l2-ctl --list-formats-ext` confirmed it
+  has no H.264 output at all, only MJPG/YUYV. `record_input_format:
+  "h264"` with `-c:v copy` fails outright with no H.264 source stream to
+  copy.
+- `media/ffmpeg.py`'s `build_record_command` now branches on
+  `record_input_format`: `"h264"` still copies the camera's stream with no
+  re-encode (zero CPU cost, unchanged from before); `"mjpeg"` now
+  software-encodes to H.264 via `libx264` (`ultrafast` preset, ~4 Mbps,
+  `yuv420p`, constant frame rate) instead of silently producing an
+  MJPEG-in-MP4 file. This has not been verified to hold 1280x720@30fps in
+  real time on a Pi 4 -- needs on-device testing.
+- Changed `config/booth.default.json`'s `record_input_format` to `"mjpeg"`
+  to match the currently connected camera.
+- Documented how to check camera capability and choose the right
+  `record_input_format` in the README ("Camera compatibility" section).
+- Added unit tests for both the `copy` and `libx264` encode paths.
