@@ -16,13 +16,11 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import threading
 import time
 from pathlib import Path
 
 import cv2
-import numpy as np
 
 from video_guestbook.config import BoothConfig, ConfigError
 from video_guestbook.hardware.hook_switch import HookSwitch, HookSwitchError
@@ -40,6 +38,8 @@ from video_guestbook.media.recorder import Recorder, RecorderError
 from video_guestbook.media.transcode import TranscodeJob, TranscodeQueue
 from video_guestbook.media.validation import validate_recording
 from video_guestbook.state_machine import BoothState, StateMachine
+from video_guestbook.ui.renderer import Renderer
+from video_guestbook.ui.theme import Theme, ThemeError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "booth.default.json"
@@ -68,10 +68,6 @@ MIC_GAIN_NUDGE_PERCENT = 15
 # touch it and instead shows the last frame captured before recording began.
 _CAMERA_RELEASED_STATES = frozenset({BoothState.RECORDING, BoothState.SAVING})
 
-_TEXT_COLOR = (255, 255, 255)
-_RECORDING_COLOR = (0, 0, 255)
-_ERROR_COLOR = (0, 0, 255)
-
 
 def _configure_capture(config: BoothConfig) -> cv2.VideoCapture:
     capture = cv2.VideoCapture(config.camera_device, cv2.CAP_V4L2)
@@ -84,58 +80,29 @@ def _configure_capture(config: BoothConfig) -> cv2.VideoCapture:
     return capture
 
 
-def _blank_frame(config: BoothConfig):
-    width, height = config.preview_width_height
-    return np.zeros((height, width, 3), dtype=np.uint8)
-
-
-def _draw_overlay(frame, text_lines: list[str], color=_TEXT_COLOR) -> None:
-    y = 40
-    for line in text_lines:
-        cv2.putText(
-            frame, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA
-        )
-        y += 40
-
-
 _METER_FLOOR_DBFS = -60.0
 _METER_CEILING_DBFS = 0.0
 
 
-def _draw_mic_meter(frame, reading: LevelReading) -> None:
-    """Draw a live microphone level bar + status text (spec section 8)."""
-    height, width = frame.shape[:2]
-    bar_x, bar_y, bar_w, bar_h = 20, height - 60, width - 40, 20
-
-    cv2.putText(
-        frame,
-        reading.status,
-        (bar_x, bar_y - 10),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        _TEXT_COLOR,
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), _TEXT_COLOR, 1)
-
-    fraction = max(
+def _mic_fraction(reading: LevelReading | None) -> float:
+    """Normalize a mic level reading's peak dBFS to a 0..1 meter fraction."""
+    if reading is None:
+        return 0.0
+    return max(
         0.0,
         min(1.0, (reading.peak_dbfs - _METER_FLOOR_DBFS) / (_METER_CEILING_DBFS - _METER_FLOOR_DBFS)),
     )
-    filled_w = int(bar_w * fraction)
-    if filled_w > 0:
-        fill_color = _RECORDING_COLOR if reading.clipped else _TEXT_COLOR
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + filled_w, bar_y + bar_h), fill_color, -1)
 
 
 class BoothApp:
-    def __init__(self, config: BoothConfig, logger: logging.Logger) -> None:
+    def __init__(self, config: BoothConfig, theme: Theme, logger: logging.Logger) -> None:
         self.config = config
+        self.theme = theme
         self.logger = logger
         self.state_machine = StateMachine(logger=logger)
         self.recorder = Recorder(config, logger=logger)
         self.transcode_queue = TranscodeQueue(config, logger=logger)
+        self.renderer = Renderer(theme, *config.preview_width_height)
         self.capture: cv2.VideoCapture | None = None
         self._last_frame = None
         self._countdown_deadline: float | None = None
@@ -456,31 +423,49 @@ class BoothApp:
             if time.monotonic() - self._state_entered_at >= ERROR_DISPLAY_SECONDS:
                 self._enter_state(BoothState.READY)
 
-    def render(self, frame) -> None:
+    def render(self, frame):
+        """Build the full themed display frame for the current state.
+
+        Only RECORDING uses the live/frozen camera frame (in a bordered
+        panel, per the theme); every other screen is fully synthetic
+        branded art, matching the "Guestbook Kiosk" design (see
+        ui/renderer.py and CHANGELOG.md).
+        """
         state = self.state_machine.state
-        if state == BoothState.READY:
-            _draw_overlay(frame, ["READY", "Press SPACE to record"])
-        elif state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
-            remaining = max(0, math.ceil(self._countdown_deadline - time.monotonic()))
-            _draw_overlay(frame, [str(remaining) if remaining > 0 else "GO"])
-            with self._mic_readings_lock:
-                latest_mic_reading = self._latest_mic_reading
-            if latest_mic_reading is not None:
-                _draw_mic_meter(frame, latest_mic_reading)
+        now = time.monotonic()
+
+        with self._mic_readings_lock:
+            latest_mic_reading = self._latest_mic_reading
+
+        if state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
+            remaining = max(0.0, self._countdown_deadline - now)
+            mic_status = latest_mic_reading.status if latest_mic_reading is not None else None
+            mic_fraction = _mic_fraction(latest_mic_reading) if latest_mic_reading is not None else None
+            return self.renderer.render_countdown(
+                now, remaining, self.config.countdown_seconds, mic_status, mic_fraction
+            )
         elif state == BoothState.RECORDING:
-            elapsed = time.monotonic() - self._state_entered_at
+            elapsed = now - self._state_entered_at
             remaining = max(0, self.config.max_recording_seconds - int(elapsed))
-            _draw_overlay(
+            # No live mic tap during recording (ffmpeg owns the audio device
+            # exclusively, same one-process-at-a-time rule as the camera);
+            # this shows the last reading from the countdown-time check.
+            return self.renderer.render_recording(
+                now,
                 frame,
-                [f"REC  {int(elapsed)}s", f"Press SPACE to stop ({remaining}s left)"],
-                color=_RECORDING_COLOR,
+                int(elapsed),
+                remaining,
+                _mic_fraction(latest_mic_reading),
+                bool(latest_mic_reading and latest_mic_reading.clipped),
             )
         elif state == BoothState.SAVING:
-            _draw_overlay(frame, ["SAVING..."])
+            return self.renderer.render_saving(now)
         elif state == BoothState.SAVED:
-            _draw_overlay(frame, ["Message saved", "Thank you!"])
+            return self.renderer.render_saved(now, now - self._state_entered_at)
         elif state == BoothState.ERROR:
-            _draw_overlay(frame, ["Something went wrong", self._last_result_reason], color=_ERROR_COLOR)
+            return self.renderer.render_error(now, self._last_result_reason)
+
+        return self.renderer.render_ready(now)
 
     def _read_frame(self):
         """Return the frame to display, honoring the camera/ffmpeg handoff."""
@@ -511,10 +496,8 @@ class BoothApp:
             running = True
             while running:
                 frame = self._read_frame()
-                display = (frame if frame is not None else _blank_frame(self.config)).copy()
-
                 self.tick()
-                self.render(display)
+                display = self.render(frame)
                 cv2.imshow(WINDOW_NAME, display)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -554,10 +537,16 @@ def main() -> int:
         print(f"Configuration error: {exc}")
         return 1
 
-    logger = setup_logging(config.log_dir)
-    logger.info("booth starting with config %s", args.config)
+    try:
+        theme = Theme.load(config.theme_dir)
+    except ThemeError as exc:
+        print(f"Theme error: {exc}")
+        return 1
 
-    app = BoothApp(config, logger)
+    logger = setup_logging(config.log_dir)
+    logger.info("booth starting with config %s, theme %s", args.config, theme.name)
+
+    app = BoothApp(config, theme, logger)
     try:
         app.run()
     except Exception:

@@ -1,0 +1,58 @@
+{
+  "name": "Classic Walnut Wedding",
+  "couple_names": "Jessica & Michael",
+  "event_date": "20 July 2024",
+  "show_couple_photo": true,
+  "colors": {
+    "bg_cream": "#F5EFE3",
+    "ink": "#1F2E22",
+    "gold": "#B08D57",
+    "gold_dark": "#8A7235",
+    "dark_bar": "#16221A",
+    "recording_red": "#B23A2C",
+    "meter_green": "#3E7A4A",
+    "meter_gold": "#B08D57",
+    "meter_amber": "#C08A2E",
+    "meter_red": "#B23A2C"
+  },
+  "fonts": {
+    "script": "fonts/GreatVibes-Regular.ttf",
+    "heading": "fonts/CormorantGaramond-700.ttf",
+    "heading_medium": "fonts/CormorantGaramond-600.ttf",
+    "body": "fonts/CormorantGaramond-500.ttf"
+  },
+  "assets": {
+    "frame": "assets/frame-floral.png",
+    "couple_photo": "assets/couple-photo.jpg"
+  },
+  "text": {
+    "welcome_eyebrow": "Welcome to our",
+    "welcome_title": "Video Guestbook",
+    "ready_prompt_1": "Pick up the phone",
+    "ready_prompt_2": "to leave a video message",
+    "ready_footer": "Lift the receiver to begin",
+    "get_ready_title": "Get Ready!",
+    "tip_camera": "Look at the camera",
+    "tip_speak": "Speak clearly",
+    "tip_smile": "Relax & smile",
+    "countdown_caption": "Recording starts in",
+    "countdown_go": "Smile!",
+    "countdown_footer": "Hang up the phone to cancel",
+    "recording_label": "Recording",
+    "recording_footer": "Hang up the phone to save your message",
+    "cam_placeholder": "Camera preview",
+    "cam_note_frozen": "Watching your message",
+    "mic_label": "Mic",
+    "mic_sublabel": "Level",
+    "saving_title": "Saving your message…",
+    "saving_sub": "Please hang up phone receiver.",
+    "saving_footer": "This will just take a few moments",
+    "thanks_title": "Thank You!",
+    "thanks_sub": "Your message has been saved",
+    "thanks_sub2": "Thank you for being part of our special day",
+    "thanks_close": "Please hang up the phone",
+    "thanks_footer": "Your message will be cherished forever",
+    "error_title": "Something Went Wrong",
+    "error_footer": "Returning to the welcome screen shortly"
+  }
+}

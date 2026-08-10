@@ -1,5 +1,93 @@
 # Changelog
 
+## Unreleased — Themed guest UI (Claude Design handoff)
+
+Implements the "Guestbook Kiosk" visual design (a Claude Design HTML/CSS/JS
+mockup, handed off for implementation) as a real, data-driven theme system
+for all 6 booth screens, replacing the plain white-text-on-video overlays
+from Milestone 1.
+
+**Rendering approach: Pillow over OpenCV, not a browser.** The mockup was a
+browser prototype (`getUserMedia()` camera, CSS keyframe animations, Web
+Audio mic meter). Two options were considered for bringing it onto the Pi:
+a Chromium kiosk browser (pixel-exact, but needs a second live video/audio
+pipeline or the browser sharing the camera with ffmpeg -- both conflict with
+the one-process-at-a-time V4L2/ALSA constraints already fought through this
+project, and add a whole new real-time process competing for CPU on
+hardware where encoder-vs-audio-capture contention already caused a real
+bug this session), or recreating the design with Pillow inside the existing
+OpenCV/ffmpeg pipeline (no new real-time processes, reuses the proven
+camera/ffmpeg handoff, close-but-not-pixel-identical animations). Went with
+the Pillow approach; the theme data (colors, fonts, copy, art) is structured
+so a future browser-kiosk renderer could reuse it without redoing the
+design work, if that's ever wanted.
+
+- Added `themes/` -- a data-driven theme system (PROJECT_SPEC.md section
+  11). `config/booth.default.json` gains a `theme_dir` field (default
+  `themes/classic-walnut`).
+  - `src/video_guestbook/ui/theme.py`: `Theme.load()` reads and fully
+    validates `theme.json` (colors, font/asset file paths, required copy
+    keys) up front, raising a clear `ThemeError` naming exactly what's
+    wrong before the app opens its window.
+  - `themes/classic-walnut/`: the shipped default theme -- `theme.json`,
+    bundled `.ttf` fonts (Great Vibes + Cormorant Garamond, converted from
+    Google Fonts' woff2 via `fonttools` so the kiosk has zero CDN/internet
+    dependency at runtime), and the floral frame/couple-photo art from the
+    design handoff.
+- Added `src/video_guestbook/ui/renderer.py`: a `Renderer` that composites
+  each of the 6 states (`READY`/`COUNTDOWN`/`RECORDING`/`SAVING`/`SAVED`/
+  `ERROR`) as a full Pillow RGBA image -- floral border art, tracked-letter
+  uppercase typography, an animated countdown ring + scale/fade numeral
+  pop-in, a pulsing recording dot and footer-bar accents, a spinning
+  "saving" ring, a progressively hand-drawn checkmark stroke on the thank-
+  you screen, and a 13-segment color-graded mic level meter -- then
+  flattens to a BGR array for `cv2.imshow`. Only `RECORDING` composites the
+  live/frozen camera frame (mirrored, in a bordered panel); every other
+  screen is fully synthetic branded art, matching the actual design file
+  (which, contrary to an earlier draft brief, only shows the camera during
+  the recording screen itself, not as a full-bleed background everywhere).
+- Fixed a real bug caught via rendered-screenshot review, not just
+  exceptions: `PIL.ImageDraw` does **not** alpha-composite when drawing
+  directly onto an image -- a semi-transparent fill just overwrites the
+  pixel's stored alpha value, so every intended "faded/unlit" element (mic
+  meter off-segments, pulsing footer hearts, the recording dot's pulse, the
+  countdown/saving ring's background track) was rendering at full opacity,
+  silently breaking the animations and the meter's on/off legibility.
+  Fixed with a `_blend_rgb`/`_blend_full` helper that pre-blends the
+  intended color against its known local background before drawing.
+- Fixed several vertical-layout overflow bugs (also only visible by
+  rendering and inspecting actual screenshots, not from exceptions or unit
+  tests alone): the countdown, saving, and thank-you screens' text/graphics
+  budgets exceeded the canvas height, pushing the countdown ring and the
+  saving/thank-you screens' final lines of text underneath the footer bar
+  where they were invisible. Recomputed tighter, verified vertical budgets
+  for all three screens.
+- `config.py`: added and fully wired `theme_dir` (was initially added as a
+  dataclass field only, without being read from the config JSON or resolved
+  against `base_dir` -- caught by a regression test before it shipped;
+  fixed to match the existing `output_dir`/`log_dir` pattern).
+- `main.py`: `BoothApp` now takes a `Theme` and builds one `Renderer` at
+  startup; `render()` dispatches to the themed per-state renderer instead
+  of `cv2.putText` overlays. The countdown-time mic level check (already a
+  real, working feature from a previous pass) now feeds the visible mic
+  meter on the countdown screen; during `RECORDING`, ffmpeg holds the audio
+  device exclusively (same constraint as the camera), so that screen's
+  meter shows the last reading from the countdown check rather than a live
+  one -- documented as a known limitation, not silently faked.
+- Added `tests/unit/test_theme.py` and `tests/unit/test_renderer.py` (44
+  new tests): theme validation (missing/invalid keys, missing files,
+  conditional couple-photo requirement) using synthetic temp themes, plus a
+  regression guard that loads the real bundled theme; renderer smoke tests
+  for all 6 screens (correct output shape/dtype, no exceptions, various
+  camera-frame aspect ratios, mic-fraction out-of-range clamping, the
+  countdown numeral's pop-in state machine). 216 tests passing overall.
+- **Known limitation, deferred on purpose:** the `RECORDING` screen's
+  camera preview is the pre-existing frozen-last-frame behavior (ffmpeg
+  owns the camera exclusively while recording, same as before this
+  change) -- a true live feed during actual recording needs ffmpeg to fan
+  out a second low-res preview stream, scoped as a distinct follow-up so it
+  isn't stacked onto this change untested on real hardware.
+
 ## Unreleased — Milestone 1: Consolidate current Beta
 
 - Initial repository structure created per PROJECT_SPEC.md section 14.

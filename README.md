@@ -19,13 +19,16 @@ plus hook-switch integration from **Milestone 2**:
 - Graceful FFmpeg stop via stdin `q`
 - **Physical receiver hook switch** (lift to start, hang up to stop/save) AND
   Spacebar both work at the same time; `q`/`Esc` to quit
-- `READY`, `COUNTDOWN`, `RECORDING`, `SAVING`, `SAVED`, `ERROR` states
+- `READY`, `COUNTDOWN`, `RECORDING`, `SAVING`, `SAVED`, `ERROR` states, each
+  rendered as a themed, data-driven screen (see "Themed guest UI" below) --
+  not just plain text overlays
 - Detailed rotating logs (`logs/booth.log`)
-- Automated unit tests (state transitions, filenames, config validation, recording validation)
+- Automated unit tests (state transitions, filenames, config validation,
+  recording validation, theme loading, screen rendering)
 - A hardware readiness script (`scripts/test_hardware.sh`)
 
-Google Drive sync, themes, and the admin UI are **out of scope** for now and
-are not implemented (see later milestones in PROJECT_SPEC.md).
+Google Drive sync and the admin UI are **out of scope** for now and are not
+implemented (see later milestones in PROJECT_SPEC.md).
 
 > **Note:** [`legacy/booth.py`](legacy/booth.py) is a verbatim backup of the
 > confirmed-working prototype from `~/video-booth/app/booth.py`, tested on the
@@ -47,6 +50,7 @@ are not implemented (see later milestones in PROJECT_SPEC.md).
 
 ```text
 config/booth.default.json   Default, validated booth configuration
+themes/classic-walnut/      Default theme: theme.json + fonts/ + assets/
 src/video_guestbook/        Application package
   config.py                 Config loading/validation
   state_machine.py          Booth state machine
@@ -61,6 +65,9 @@ src/video_guestbook/        Application package
     audio_levels.py            Mic level sampling/classification (dBFS via arecord)
     mixer.py                   ALSA capture-gain discovery + one-shot nudge
     transcode.py                Background raw->H.264 transcode queue ("quality" mode)
+  ui/
+    theme.py                  Theme loading/validation (theme.json + font/asset paths)
+    renderer.py                Pillow-based screen renderer for all 6 booth states
 scripts/
   install.sh                 System + Python dependency installer
   test_hardware.sh            Camera/mic/amixer/ffmpeg/output-dir readiness check
@@ -175,6 +182,7 @@ Key fields:
 | `hook_switch_enabled`    | `true` (default) to use the physical receiver switch; `false` for Spacebar-only |
 | `hook_switch_gpio_pin`   | BCM GPIO pin number for the primary hook-switch signal (default `17`, per PROJECT_SPEC.md section 4) |
 | `recording_mode`         | `quality` (default, deferred background transcode, no audio-dropout risk) or `fast` (live transcode, immediately final). Only matters when `record_input_format` is `mjpeg`. See "Recording modes" below. |
+| `theme_dir`              | Path to a theme directory (default `themes/classic-walnut`), relative to the repository root. See "Themed guest UI" below. |
 
 ## Camera compatibility (H.264 vs MJPEG)
 
@@ -229,6 +237,79 @@ Check `logs/booth.log` for lines starting with `queued transcode for
 session`, `transcoding session`, and `transcode complete for session` (or
 `transcode failed for session`, which always names the preserved raw file)
 to watch the background queue's progress.
+
+## Themed guest UI
+
+All 6 booth screens (`READY`, `COUNTDOWN`, `RECORDING`, `SAVING`, `SAVED`,
+`ERROR`) are rendered by `src/video_guestbook/ui/renderer.py` from a
+**theme** — a directory of `theme.json` plus font and image assets, pointed
+to by `theme_dir` in config (default: `themes/classic-walnut`). Nothing
+visual is hard-coded into the renderer: colors, fonts, copy, and border art
+all come from the active theme, so a new event just needs a new theme
+directory, not a code change.
+
+This recreates the visual design of a "Guestbook Kiosk" mockup built in
+Claude Design (an HTML/CSS/JS prototype) inside the existing OpenCV/ffmpeg
+pipeline via Pillow, rather than adopting a browser runtime for the guest UI.
+A browser-kiosk implementation (real CSS animations, exact pixel match) was
+considered and explicitly deferred: it would need the guest-facing browser
+to either share the camera with ffmpeg (conflicts with the one-process-at-
+a-time V4L2 constraint this project already had to work around once) or add
+a second live video/audio pipeline, and would run a full browser process
+alongside ffmpeg on hardware where CPU contention has already caused a real
+audio-dropout bug this session. The Pillow renderer reuses the proven
+camera/ffmpeg handoff untouched and adds no new real-time processes.
+
+### Making or editing a theme
+
+A theme directory looks like:
+
+```text
+themes/classic-walnut/
+  theme.json          Colors, fonts, copy, couple names/date, toggles
+  fonts/               .ttf files referenced by theme.json (bundled locally
+                        so the kiosk never depends on an internet connection
+                        or Google Fonts CDN)
+  assets/
+    frame-floral.png    Decorative border art, drawn behind all screens
+    couple-photo.jpg     Optional portrait shown on the READY screen
+```
+
+`theme.json` fields:
+
+- `name` — human-readable theme name (logged at startup).
+- `couple_names`, `event_date` — shown on most screens.
+- `show_couple_photo` — if `true`, `assets.couple_photo` is required.
+- `colors` — 10 required `#RRGGBB` keys: `bg_cream`, `ink`, `gold`,
+  `gold_dark`, `dark_bar`, `recording_red`, and the 4-color mic meter
+  gradient (`meter_green`, `meter_gold`, `meter_amber`, `meter_red`).
+- `fonts` — 4 required keys (`script`, `heading`, `heading_medium`, `body`),
+  each a path to a `.ttf` file relative to the theme directory.
+- `assets` — `frame` (required) and `couple_photo` (required only when
+  `show_couple_photo` is `true`), paths relative to the theme directory.
+- `text` — the exact copy shown on every screen (prompts, footer bar text,
+  tip labels, etc.) — see `themes/classic-walnut/theme.json` for the full
+  list of required keys.
+
+To make a new theme: copy `themes/classic-walnut/`, edit `theme.json` and
+swap the assets, then point `theme_dir` at it in `config/booth.local.json`.
+`Theme.load()` validates the whole file up front (missing keys, bad color
+formats, missing font/asset files) and raises a clear error naming exactly
+what's wrong, before the app opens its window.
+
+### Known limitation: no live camera feed except during RECORDING
+
+Only the `RECORDING` screen shows the camera (in a bordered panel, mirrored,
+matching the design) — every other screen is fully synthetic branded art.
+The `RECORDING` screen's live preview freezes at the last frame captured
+before ffmpeg takes over the camera (see the camera/ffmpeg handoff note
+above) — this is the same pre-existing hardware constraint as the legacy
+prototype, not a regression. A true live feed during actual recording would
+need ffmpeg to fan out a second low-res preview stream while it records,
+which is a real but separate follow-up (see CHANGELOG.md). Similarly, the
+`RECORDING` screen's mic meter shows the last reading from the
+countdown-time mic check rather than updating live, since ffmpeg also holds
+the audio device exclusively while recording.
 
 ## Fixing audio/video sync
 
@@ -418,6 +499,13 @@ Covers:
 - Configuration validation (valid + many invalid cases)
 - Recording validation logic (missing file, empty file, missing streams,
   short duration, ffprobe failures) using a mocked `ffprobe`
+- Hook switch debouncing/edge detection, mic level classification/mixer gain
+  math, recording_mode branching, and the background transcode queue, all
+  via monkeypatched subprocess/GPIO calls
+- Theme loading/validation (`tests/unit/test_theme.py`) and screen rendering
+  (`tests/unit/test_renderer.py`) against the real bundled
+  `themes/classic-walnut` theme -- every screen is rendered and checked for
+  correct output shape/dtype with no real display or camera required
 
 ### Manual acceptance tests (must be run on the actual Raspberry Pi)
 

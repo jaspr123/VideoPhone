@@ -90,6 +90,10 @@ class BoothConfig:
     # cameras with real onboard H.264, this setting has no effect: -c:v copy
     # is already both the fastest and highest-quality option.
     recording_mode: str = "quality"
+    # Directory containing theme.json plus font/image assets for the
+    # guest-facing screens (PROJECT_SPEC.md section 11). Resolved relative to
+    # base_dir, same as output_dir/log_dir. See src/video_guestbook/ui/theme.py.
+    theme_dir: Path = Path("themes/classic-walnut")
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -198,6 +202,10 @@ class BoothConfig:
                 f"got {recording_mode!r}"
             )
 
+        theme_dir = str(data.get("theme_dir", "themes/classic-walnut")).strip()
+        if not theme_dir:
+            raise ConfigError("theme_dir must not be empty")
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -217,6 +225,7 @@ class BoothConfig:
             hook_switch_enabled=hook_switch_enabled,
             hook_switch_gpio_pin=hook_switch_gpio_pin,
             recording_mode=recording_mode,
+            theme_dir=(base_dir / theme_dir).resolve(),
         )
 
     @classmethod

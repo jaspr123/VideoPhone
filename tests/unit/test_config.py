@@ -115,6 +115,21 @@ def test_recording_mode_rejects_invalid_values(mode):
         BoothConfig.from_dict(valid_config_dict(recording_mode=mode))
 
 
+def test_theme_dir_defaults_when_absent(tmp_path):
+    config = BoothConfig.from_dict(valid_config_dict(), base_dir=tmp_path)
+    assert config.theme_dir == (tmp_path / "themes/classic-walnut").resolve()
+
+
+def test_theme_dir_can_be_overridden(tmp_path):
+    config = BoothConfig.from_dict(valid_config_dict(theme_dir="themes/some-other-theme"), base_dir=tmp_path)
+    assert config.theme_dir == (tmp_path / "themes/some-other-theme").resolve()
+
+
+def test_theme_dir_rejects_empty_string():
+    with pytest.raises(ConfigError, match="theme_dir"):
+        BoothConfig.from_dict(valid_config_dict(theme_dir=""))
+
+
 def test_missing_key_raises():
     data = valid_config_dict()
     del data["audio_device"]
