@@ -84,6 +84,13 @@ class Theme:
     frame_path: Path
     couple_photo_path: Path | None
     text: dict[str, str]
+    # Optional overrides -- absent keys fall back to built-in behavior
+    # (no sound played; procedural vector icon drawn). Unlike the required
+    # sections above, these are not validated against a fixed key set:
+    # any key the caller looks up (e.g. sounds["pickup"], icons["camera"])
+    # is either present and file-checked, or simply not there.
+    sounds: dict[str, Path]
+    icon_paths: dict[str, Path]
 
     @classmethod
     def load(cls, theme_dir: Path) -> "Theme":
@@ -164,6 +171,9 @@ class Theme:
             raise ThemeError(f"theme.json 'text' missing keys: {', '.join(sorted(missing_text))}")
         text = {k: str(raw_text_map[k]) for k in REQUIRED_TEXT_KEYS}
 
+        sounds = _resolve_optional_file_map(data.get("sounds", {}), theme_dir, "sounds")
+        icon_paths = _resolve_optional_file_map(data.get("icons", {}), theme_dir, "icons")
+
         return cls(
             name=name,
             couple_names=couple_names,
@@ -174,4 +184,26 @@ class Theme:
             frame_path=frame_path,
             couple_photo_path=couple_photo_path,
             text=text,
+            sounds=sounds,
+            icon_paths=icon_paths,
         )
+
+
+def _resolve_optional_file_map(raw: object, theme_dir: Path, field_name: str) -> dict[str, Path]:
+    """Resolve an optional {key: relative_path} theme.json section.
+
+    Every key present must point at a real file (typos should fail loudly
+    at startup), but the section itself -- and any individual key -- may be
+    omitted entirely to fall back to built-in behavior.
+    """
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ThemeError(f"theme.json {field_name!r} must be an object")
+    resolved: dict[str, Path] = {}
+    for key, rel_path in raw.items():
+        path = (theme_dir / str(rel_path)).resolve()
+        if not path.is_file():
+            raise ThemeError(f"theme.json {field_name}.{key} points at a missing file: {path}")
+        resolved[key] = path
+    return resolved

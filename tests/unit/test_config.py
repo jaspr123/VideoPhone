@@ -130,6 +130,21 @@ def test_theme_dir_rejects_empty_string():
         BoothConfig.from_dict(valid_config_dict(theme_dir=""))
 
 
+def test_audio_playback_device_defaults_to_none():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.audio_playback_device is None
+
+
+def test_audio_playback_device_can_be_set():
+    config = BoothConfig.from_dict(valid_config_dict(audio_playback_device="plughw:CARD=Device,DEV=0"))
+    assert config.audio_playback_device == "plughw:CARD=Device,DEV=0"
+
+
+def test_audio_playback_device_rejects_empty_string():
+    with pytest.raises(ConfigError, match="audio_playback_device"):
+        BoothConfig.from_dict(valid_config_dict(audio_playback_device=""))
+
+
 def test_missing_key_raises():
     data = valid_config_dict()
     del data["audio_device"]

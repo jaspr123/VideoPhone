@@ -65,6 +65,7 @@ src/video_guestbook/        Application package
     audio_levels.py            Mic level sampling/classification (dBFS via arecord)
     mixer.py                   ALSA capture-gain discovery + one-shot nudge
     transcode.py                Background raw->H.264 transcode queue ("quality" mode)
+    audio_playback.py            Fire-and-forget prompt-sound playback (aplay)
   ui/
     theme.py                  Theme loading/validation (theme.json + font/asset paths)
     renderer.py                Pillow-based screen renderer for all 6 booth states
@@ -183,6 +184,7 @@ Key fields:
 | `hook_switch_gpio_pin`   | BCM GPIO pin number for the primary hook-switch signal (default `17`, per PROJECT_SPEC.md section 4) |
 | `recording_mode`         | `quality` (default, deferred background transcode, no audio-dropout risk) or `fast` (live transcode, immediately final). Only matters when `record_input_format` is `mjpeg`. See "Recording modes" below. |
 | `theme_dir`              | Path to a theme directory (default `themes/classic-walnut`), relative to the repository root. See "Themed guest UI" below. |
+| `audio_playback_device`  | ALSA *playback* device for prompt sounds (e.g. the pickup greeting), e.g. `plughw:CARD=Device,DEV=0`. `null`/omitted uses the system default output. Separate from `audio_device` (the microphone). |
 
 ## Camera compatibility (H.264 vs MJPEG)
 
@@ -290,6 +292,15 @@ themes/classic-walnut/
 - `text` — the exact copy shown on every screen (prompts, footer bar text,
   tip labels, etc.) — see `themes/classic-walnut/theme.json` for the full
   list of required keys.
+- `sounds` — **optional**. `{"pickup": "sounds/pickup.wav"}` plays that clip
+  when the receiver is lifted (or Spacebar pressed) and the countdown
+  begins. Omit the whole section, or just the `pickup` key, for no sound.
+  See "Pickup greeting sound" below.
+- `icons` — **optional**. Override any of the `COUNTDOWN` screen's three tip
+  icons (`camera`, `mic`, `smile`) with your own transparent PNG instead of
+  the built-in vector drawing, e.g.
+  `{"icons": {"camera": "assets/icon-camera.png"}}`. Any icon key you don't
+  provide keeps the built-in icon. See "Custom tip icons" below.
 
 To make a new theme: copy `themes/classic-walnut/`, edit `theme.json` and
 swap the assets, then point `theme_dir` at it in `config/booth.local.json`.
@@ -297,19 +308,71 @@ swap the assets, then point `theme_dir` at it in `config/booth.local.json`.
 formats, missing font/asset files) and raises a clear error naming exactly
 what's wrong, before the app opens its window.
 
-### Known limitation: no live camera feed except during RECORDING
+### Pickup greeting sound
+
+To play a short spoken prompt ("please leave us a message...") when a guest
+lifts the receiver:
+
+1. Drop a `.wav` file in your theme directory, e.g.
+   `themes/classic-walnut/sounds/pickup.wav`.
+2. Add it to `theme.json`: `"sounds": {"pickup": "sounds/pickup.wav"}`.
+3. If your handset's speaker isn't the system's default ALSA playback
+   device, set `audio_playback_device` in config (e.g.
+   `"plughw:CARD=Device,DEV=0"`) — this is a separate field from
+   `audio_device`, which is the *microphone* (capture); leave it unset to
+   use the system default output.
+
+Playback is fire-and-forget via `aplay` (`media/audio_playback.py`) — it
+starts in the background right when the countdown begins and never blocks
+or delays the countdown, recording, or anything else. A missing sound file,
+missing `aplay` binary, or bad playback device is logged as a warning
+(`logs/booth.log`) and otherwise ignored, never crashes the app.
+
+### Custom tip icons
+
+The `COUNTDOWN` screen's three tips (look at camera / speak clearly / relax
+& smile) draw simple built-in vector icons by default. To use your own
+artwork instead, add transparent PNGs to your theme's `assets/` folder and
+reference them under `icons` in `theme.json`:
+
+```json
+"icons": {
+  "camera": "assets/icon-camera.png",
+  "mic": "assets/icon-mic.png",
+  "smile": "assets/icon-smile.png"
+}
+```
+
+Any subset works — an icon key you omit keeps the built-in drawing for that
+tip. Icons are scaled down to fit their slot while preserving aspect ratio
+(no cropping), so any reasonable square-ish PNG works.
+
+### Known limitations: RECORDING screen's live preview and mic meter
 
 Only the `RECORDING` screen shows the camera (in a bordered panel, mirrored,
 matching the design) — every other screen is fully synthetic branded art.
-The `RECORDING` screen's live preview freezes at the last frame captured
+The `RECORDING` screen's live preview **freezes at the last frame** captured
 before ffmpeg takes over the camera (see the camera/ffmpeg handoff note
 above) — this is the same pre-existing hardware constraint as the legacy
-prototype, not a regression. A true live feed during actual recording would
-need ffmpeg to fan out a second low-res preview stream while it records,
-which is a real but separate follow-up (see CHANGELOG.md). Similarly, the
-`RECORDING` screen's mic meter shows the last reading from the
-countdown-time mic check rather than updating live, since ffmpeg also holds
-the audio device exclusively while recording.
+prototype, not a regression, and it's expected to look static/non-live.
+Likewise, the `RECORDING` screen's mic meter is designed to **freeze at the
+last reading** from the countdown-time mic check rather than update live,
+since ffmpeg also holds the audio device exclusively while recording.
+
+If the mic meter looks completely empty/blank the *entire* time (not just
+static-but-lit), that's not this limitation — it means the countdown-time
+mic check itself never got a reading. Check `logs/booth.log` for lines
+starting with `countdown mic check` around the time you lifted the
+receiver; a `could not start` or `stopped early` warning there points at a
+real capture problem (wrong `audio_device`, `arecord` missing, device busy)
+worth chasing separately from the frozen-vs-live design limitation.
+
+A true live feed and live meter during actual recording would need ffmpeg
+to fan out a second low-res preview stream (video) and a way to tap the
+audio device without taking it from ffmpeg (audio) while it records — a
+real but separate follow-up (see CHANGELOG.md), not attempted here since it
+changes the same camera/audio exclusivity architecture that caused a real
+CPU-contention audio bug earlier this project, untested on real hardware.
 
 ## Fixing audio/video sync
 

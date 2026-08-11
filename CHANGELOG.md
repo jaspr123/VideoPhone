@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — Pickup greeting sound + custom tip icons
+
+Follow-up feedback after the themed-UI pass landed on real hardware: a
+pickup greeting request, custom icon artwork for the countdown screen, and
+two reports ("mic levels on the record screen weren't working", "neither
+was the live preview") that turned out to be the RECORDING screen's
+already-documented frozen-preview/frozen-meter limitation, not new bugs —
+clarified in the README with a way to tell that apart from an actual mic
+capture failure (check `logs/booth.log` for `countdown mic check` warnings).
+
+- Added `src/video_guestbook/media/audio_playback.py`: fire-and-forget
+  `aplay` playback (`play_sound_async`), centralized like every other
+  subprocess call in `media/` -- never blocks, never raises (missing file,
+  missing `aplay`, bad device are all logged and swallowed per rule 17).
+- `config.py`: added `audio_playback_device` (optional ALSA *playback*
+  device, e.g. for a handset speaker that isn't the system default;
+  distinct from `audio_device`, the microphone).
+- `ui/theme.py`: added two **optional** theme.json sections that fall back
+  to built-in behavior when absent (unlike the required colors/fonts/text
+  sections): `sounds` (currently just `pickup`, played when the receiver
+  is lifted) and `icons` (override any of the countdown screen's `camera`/
+  `mic`/`smile` tip icons with a transparent PNG instead of the built-in
+  vector drawing -- any subset of the three keys works).
+- `ui/renderer.py`: loads any theme-provided icon PNGs at startup and
+  pastes them (aspect-preserving, no cropping) in place of the procedural
+  icon for that tip; a missing/corrupt custom icon file falls back to the
+  built-in vector icon rather than crashing.
+- `main.py`: `_start_countdown()` (fired by both the hook switch and
+  Spacebar, same as always) now also fires the theme's pickup sound if one
+  is configured -- fully optional, silent no-op when the theme has none.
+- Added `tests/unit/test_audio_playback.py` (mocked `aplay`/subprocess),
+  extended `test_theme.py` (sounds/icons validation) and `test_config.py`
+  (`audio_playback_device`), and added pickup-greeting integration tests to
+  `test_main.py`. 234 tests passing.
+- No default pickup sound or custom icon artwork is bundled -- both are
+  fully optional and off until a theme supplies them, since the actual
+  audio wording/voice and icon artwork are something the user wants to
+  choose, not something to generate on their behalf without asking.
+
 ## Unreleased — Themed guest UI (Claude Design handoff)
 
 Implements the "Guestbook Kiosk" visual design (a Claude Design HTML/CSS/JS

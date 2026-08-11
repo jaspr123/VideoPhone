@@ -33,6 +33,7 @@ from video_guestbook.media.audio_levels import (
     MicrophoneError,
     classify_level,
 )
+from video_guestbook.media.audio_playback import play_sound_async
 from video_guestbook.media.mixer import MixerError, nudge_capture_gain
 from video_guestbook.media.recorder import Recorder, RecorderError
 from video_guestbook.media.transcode import TranscodeJob, TranscodeQueue
@@ -208,6 +209,19 @@ class BoothApp:
         self._enter_state(BoothState.COUNTDOWN)
         self._countdown_deadline = time.monotonic() + self.config.countdown_seconds
         self._start_mic_check()
+        self._play_pickup_greeting()
+
+    def _play_pickup_greeting(self) -> None:
+        """Best-effort spoken prompt on pickup (PROJECT_SPEC.md section 6,
+        "optional spoken prompt through earpiece"). Fire-and-forget: does
+        not delay or block the countdown, and a missing/broken theme sound
+        or speaker must never affect recording (rule 17)."""
+        pickup_sound = self.theme.sounds.get("pickup")
+        if pickup_sound is None:
+            return
+        play_sound_async(
+            pickup_sound, device=self.config.audio_playback_device, logger=self.logger
+        )
 
     def _cancel_countdown(self) -> None:
         """Receiver replaced before the countdown finished -- spec section 20

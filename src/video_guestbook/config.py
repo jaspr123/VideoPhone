@@ -94,6 +94,12 @@ class BoothConfig:
     # guest-facing screens (PROJECT_SPEC.md section 11). Resolved relative to
     # base_dir, same as output_dir/log_dir. See src/video_guestbook/ui/theme.py.
     theme_dir: Path = Path("themes/classic-walnut")
+    # ALSA *playback* device for prompt sounds (e.g. the pickup greeting),
+    # via `aplay -D <device>`. Distinct from audio_device (the microphone
+    # *capture* device) -- on hardware where the handset's speaker and mic
+    # are the same USB audio adapter these may look similar but are not
+    # interchangeable. None (default) uses aplay's system default device.
+    audio_playback_device: str | None = None
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -206,6 +212,12 @@ class BoothConfig:
         if not theme_dir:
             raise ConfigError("theme_dir must not be empty")
 
+        audio_playback_device = data.get("audio_playback_device")
+        if audio_playback_device is not None:
+            audio_playback_device = str(audio_playback_device).strip()
+            if not audio_playback_device:
+                raise ConfigError("audio_playback_device must not be empty when set (use null to omit)")
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -226,6 +238,7 @@ class BoothConfig:
             hook_switch_gpio_pin=hook_switch_gpio_pin,
             recording_mode=recording_mode,
             theme_dir=(base_dir / theme_dir).resolve(),
+            audio_playback_device=audio_playback_device,
         )
 
     @classmethod

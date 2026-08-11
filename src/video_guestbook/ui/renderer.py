@@ -65,6 +65,7 @@ class Renderer:
         self._bg = self._load_background()
         self._bg_dimmed = self._dim_background(self._bg, 0.28)
         self._couple_photo = self._load_couple_photo() if theme.show_couple_photo else None
+        self._custom_icons = self._load_custom_icons()
         self._pop_state: tuple[object, float] | None = None
 
     # ── one-time asset preparation ──────────────────────────────────
@@ -85,6 +86,18 @@ class Renderer:
             return None
         box_w, box_h = int(self.w * 0.22), int(self.h * 0.68)
         return _cover_resize(photo, box_w, box_h)
+
+    def _load_custom_icons(self) -> dict[str, Image.Image]:
+        """Load any theme-provided tip icons (Theme.load already verified
+        the files exist); a corrupt/unreadable file falls back to the
+        built-in procedural icon rather than crashing the app."""
+        icons: dict[str, Image.Image] = {}
+        for key, path in self.theme.icon_paths.items():
+            try:
+                icons[key] = Image.open(path).convert("RGBA")
+            except OSError:
+                continue
+        return icons
 
     def _font(self, key: str, size: int) -> ImageFont.FreeTypeFont:
         size = max(1, int(size))
@@ -244,6 +257,17 @@ class Renderer:
         draw.ellipse([cx + r * 0.38 - eye_r, cy - r * 0.15 - eye_r, cx + r * 0.38 + eye_r, cy - r * 0.15 + eye_r], fill=color)
         draw.arc([cx - r * 0.55, cy - r * 0.1, cx + r * 0.55, cy + r * 0.65], 20, 160, fill=color, width=2)
 
+    def _draw_tip_icon(self, canvas, draw, key, icon_fn, cx: float, cy: float, size: float, color) -> None:
+        """Paste a theme-provided PNG for `key` if one was supplied, else
+        draw the built-in procedural icon."""
+        custom = self._custom_icons.get(key)
+        if custom is not None:
+            fitted = _contain_resize(custom, int(size), int(size))
+            px, py = int(cx - fitted.width / 2), int(cy - fitted.height / 2)
+            canvas.alpha_composite(fitted, (px, py))
+        else:
+            icon_fn(draw, cx, cy, size, color)
+
     # ── screens ───────────────────────────────────────────────────
     def render_ready(self, now: float) -> np.ndarray:
         t = self.theme
@@ -362,9 +386,9 @@ class Renderer:
         y += self.h * 0.175
 
         tips = [
-            (self._icon_camera, t.text["tip_camera"]),
-            (self._icon_mic, t.text["tip_speak"]),
-            (self._icon_smile, t.text["tip_smile"]),
+            ("camera", self._icon_camera, t.text["tip_camera"]),
+            ("mic", self._icon_mic, t.text["tip_speak"]),
+            ("smile", self._icon_smile, t.text["tip_smile"]),
         ]
         tips_w = self.w * 0.86
         col_w = tips_w / 3
@@ -373,9 +397,9 @@ class Renderer:
         tip_label_font = self._font("heading", int(self.h * 0.024))
         draw.line([(tips_x0, y), (tips_x0 + tips_w, y)], fill=gold, width=1)
         row_h = self.h * 0.145
-        for i, (icon_fn, label) in enumerate(tips):
+        for i, (key, icon_fn, label) in enumerate(tips):
             col_cx = tips_x0 + col_w * (i + 0.5)
-            icon_fn(draw, col_cx, y + row_h * 0.36, icon_size, ink)
+            self._draw_tip_icon(canvas, draw, key, icon_fn, col_cx, y + row_h * 0.36, icon_size, ink)
             self._draw_tracked(draw, col_cx, y + row_h * 0.74, label.upper(), tip_label_font, ink, spacing=1.0)
             if i > 0:
                 draw.line(
@@ -698,6 +722,14 @@ def _cover_resize(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
     x0 = (new_w - box_w) // 2
     y0 = (new_h - box_h) // 2
     return resized.crop((x0, y0, x0 + box_w, y0 + box_h))
+
+
+def _contain_resize(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
+    """Scale down to fit within box_w x box_h, preserving aspect ratio."""
+    src_w, src_h = img.size
+    scale = min(box_w / src_w, box_h / src_h)
+    new_w, new_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
+    return img.resize((new_w, new_h), Image.LANCZOS)
 
 
 def _fit_cover_bgr(frame_bgr: np.ndarray, box_w: int, box_h: int) -> np.ndarray:

@@ -146,6 +146,60 @@ def test_show_couple_photo_must_be_bool(tmp_path):
         Theme.load(tmp_path)
 
 
+def test_sounds_and_icons_default_to_empty_when_absent(tmp_path):
+    _write_theme(tmp_path, _valid_theme_data())
+    theme = Theme.load(tmp_path)
+    assert theme.sounds == {}
+    assert theme.icon_paths == {}
+
+
+def test_sounds_resolved_when_present(tmp_path):
+    data = _valid_theme_data()
+    _write_theme(tmp_path, data)
+    (tmp_path / "sounds").mkdir()
+    (tmp_path / "sounds" / "pickup.wav").touch()
+    data["sounds"] = {"pickup": "sounds/pickup.wav"}
+    (tmp_path / "theme.json").write_text(json.dumps(data), encoding="utf-8")
+
+    theme = Theme.load(tmp_path)
+    assert theme.sounds["pickup"] == (tmp_path / "sounds" / "pickup.wav").resolve()
+
+
+def test_sounds_missing_file_raises(tmp_path):
+    data = _valid_theme_data()
+    data["sounds"] = {"pickup": "sounds/does-not-exist.wav"}
+    _write_theme(tmp_path, data)
+    with pytest.raises(ThemeError, match="sounds.pickup"):
+        Theme.load(tmp_path)
+
+
+def test_icons_resolved_when_present(tmp_path):
+    data = _valid_theme_data()
+    _write_theme(tmp_path, data)
+    (tmp_path / "assets" / "icon-camera.png").touch()
+    data["icons"] = {"camera": "assets/icon-camera.png"}
+    (tmp_path / "theme.json").write_text(json.dumps(data), encoding="utf-8")
+
+    theme = Theme.load(tmp_path)
+    assert theme.icon_paths["camera"] == (tmp_path / "assets" / "icon-camera.png").resolve()
+
+
+def test_icons_missing_file_raises(tmp_path):
+    data = _valid_theme_data()
+    data["icons"] = {"camera": "assets/does-not-exist.png"}
+    _write_theme(tmp_path, data)
+    with pytest.raises(ThemeError, match="icons.camera"):
+        Theme.load(tmp_path)
+
+
+def test_sounds_must_be_object(tmp_path):
+    data = _valid_theme_data()
+    data["sounds"] = "not-an-object"
+    _write_theme(tmp_path, data)
+    with pytest.raises(ThemeError, match="sounds"):
+        Theme.load(tmp_path)
+
+
 def test_real_bundled_theme_loads():
     """Regression guard: the shipped default theme must always be valid."""
     theme = Theme.load(REAL_THEME_DIR)
