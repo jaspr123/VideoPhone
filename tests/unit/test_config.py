@@ -161,6 +161,30 @@ def test_live_preview_enabled_rejects_non_bool(value):
         BoothConfig.from_dict(valid_config_dict(live_preview_enabled=value))
 
 
+def test_live_mic_meter_enabled_defaults_to_false():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.live_mic_meter_enabled is False
+
+
+def test_live_mic_meter_enabled_can_be_turned_on():
+    config = BoothConfig.from_dict(valid_config_dict(live_mic_meter_enabled=True))
+    assert config.live_mic_meter_enabled is True
+
+
+def test_live_mic_meter_enabled_is_independent_of_live_preview_enabled():
+    config = BoothConfig.from_dict(
+        valid_config_dict(live_preview_enabled=False, live_mic_meter_enabled=True)
+    )
+    assert config.live_preview_enabled is False
+    assert config.live_mic_meter_enabled is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_live_mic_meter_enabled_rejects_non_bool(value):
+    with pytest.raises(ConfigError, match="live_mic_meter_enabled"):
+        BoothConfig.from_dict(valid_config_dict(live_mic_meter_enabled=value))
+
+
 def test_missing_key_raises():
     data = valid_config_dict()
     del data["audio_device"]

@@ -15,7 +15,6 @@ from video_guestbook.media.audio_levels import (
     MicrophoneError,
     classify_level,
     pcm16_to_dbfs,
-    read_latest_live_level,
 )
 
 
@@ -203,89 +202,3 @@ def test_reader_context_manager_starts_and_stops(monkeypatch):
         assert reader.is_running
 
     assert fake.terminated is True
-
-
-# ---------------------------------------------------------------------------
-# read_latest_live_level (parses ffmpeg's ametadata=print output -- see
-# media/ffmpeg.py live_level_path)
-# ---------------------------------------------------------------------------
-
-
-def test_read_latest_live_level_missing_file_returns_none(tmp_path):
-    assert read_latest_live_level(tmp_path / "does-not-exist.txt") is None
-
-
-def test_read_latest_live_level_empty_file_returns_none(tmp_path):
-    path = tmp_path / "levels.txt"
-    path.write_text("", encoding="utf-8")
-    assert read_latest_live_level(path) is None
-
-
-def test_read_latest_live_level_incomplete_pair_returns_none(tmp_path):
-    # Only Peak has been flushed so far -- e.g. a read caught mid-write.
-    path = tmp_path / "levels.txt"
-    path.write_text("frame:0    pts:0\nlavfi.astats.1.Peak_level=-18.5\n", encoding="utf-8")
-    assert read_latest_live_level(path) is None
-
-
-def test_read_latest_live_level_parses_single_reading(tmp_path):
-    path = tmp_path / "levels.txt"
-    path.write_text(
-        "frame:0    pts:0       pts_time:0\n"
-        "lavfi.astats.1.Peak_level=-18.063496\n"
-        "lavfi.astats.1.RMS_level=-24.492307\n",
-        encoding="utf-8",
-    )
-
-    reading = read_latest_live_level(path)
-
-    assert reading is not None
-    assert reading.peak_dbfs == pytest.approx(-18.063496)
-    assert reading.rms_dbfs == pytest.approx(-24.492307)
-    assert reading.clipped is False
-    assert reading.status == classify_level(reading.rms_dbfs, reading.peak_dbfs)
-
-
-def test_read_latest_live_level_uses_most_recent_pair(tmp_path):
-    path = tmp_path / "levels.txt"
-    path.write_text(
-        "frame:0    pts:0\n"
-        "lavfi.astats.1.Peak_level=-5.0\n"
-        "lavfi.astats.1.RMS_level=-10.0\n"
-        "frame:1    pts:4800\n"
-        "lavfi.astats.1.Peak_level=-30.0\n"
-        "lavfi.astats.1.RMS_level=-40.0\n",
-        encoding="utf-8",
-    )
-
-    reading = read_latest_live_level(path)
-
-    assert reading.peak_dbfs == pytest.approx(-30.0)
-    assert reading.rms_dbfs == pytest.approx(-40.0)
-
-
-def test_read_latest_live_level_detects_clipping(tmp_path):
-    path = tmp_path / "levels.txt"
-    path.write_text(
-        f"lavfi.astats.1.Peak_level={CLIP_PEAK_DBFS}\nlavfi.astats.1.RMS_level=-10.0\n",
-        encoding="utf-8",
-    )
-
-    reading = read_latest_live_level(path)
-
-    assert reading.clipped is True
-
-
-def test_read_latest_live_level_handles_negative_infinity(tmp_path):
-    # True silence: astats reports -inf, not a numeric floor value.
-    path = tmp_path / "levels.txt"
-    path.write_text(
-        "lavfi.astats.1.Peak_level=-inf\nlavfi.astats.1.RMS_level=-inf\n",
-        encoding="utf-8",
-    )
-
-    reading = read_latest_live_level(path)
-
-    assert reading.peak_dbfs == float("-inf")
-    assert reading.rms_dbfs == float("-inf")
-    assert reading.clipped is False

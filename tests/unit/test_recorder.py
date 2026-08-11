@@ -103,34 +103,29 @@ def test_mjpeg_quality_mode_uses_separate_raw_path_needs_transcode(tmp_path):
     assert session.final_output_path.name.startswith(session.session_id)
 
 
-def test_live_preview_disabled_by_default_leaves_paths_none(tmp_path):
+def test_live_preview_disabled_by_default_leaves_path_none(tmp_path):
     config = make_config(tmp_path)
     session = Recorder(config).start()
 
     assert session.live_preview_path is None
-    assert session.live_level_path is None
 
 
-def test_live_preview_enabled_sets_paths_under_log_dir(tmp_path):
+def test_live_preview_enabled_sets_path_under_log_dir(tmp_path):
     config = make_config(tmp_path, live_preview_enabled=True)
     session = Recorder(config).start()
 
     assert session.live_preview_path == config.log_dir / "live_preview.jpg"
-    assert session.live_level_path == config.log_dir / "live_level.txt"
 
 
-def test_live_preview_start_clears_stale_files_from_prior_session(tmp_path):
+def test_live_preview_start_clears_stale_file_from_prior_session(tmp_path):
     config = make_config(tmp_path, live_preview_enabled=True)
     config.log_dir.mkdir(parents=True, exist_ok=True)
     stale_preview = config.log_dir / "live_preview.jpg"
-    stale_level = config.log_dir / "live_level.txt"
     stale_preview.write_bytes(b"stale jpeg bytes")
-    stale_level.write_text("stale level data")
 
     Recorder(config).start()
 
     assert not stale_preview.exists()
-    assert not stale_level.exists()
 
 
 def test_start_raises_if_already_running(tmp_path):

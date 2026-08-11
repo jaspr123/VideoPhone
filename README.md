@@ -185,7 +185,8 @@ Key fields:
 | `recording_mode`         | `quality` (default, deferred background transcode, no audio-dropout risk) or `fast` (live transcode, immediately final). Only matters when `record_input_format` is `mjpeg`. See "Recording modes" below. |
 | `theme_dir`              | Path to a theme directory (default `themes/classic-walnut`), relative to the repository root. See "Themed guest UI" below. |
 | `audio_playback_device`  | ALSA *playback* device for prompt sounds (e.g. the pickup greeting), e.g. `plughw:CARD=Device,DEV=0`. `null`/omitted uses the system default output. Separate from `audio_device` (the microphone). |
-| `live_preview_enabled`   | `false` (default) for the safe, frozen-preview/frozen-meter RECORDING screen. `true` for a genuinely live camera preview + mic meter -- opt-in, see "Live camera preview and mic meter during RECORDING" below. |
+| `live_preview_enabled`   | `false` (default) for a frozen-frame RECORDING screen preview. `true` for a genuinely live camera preview -- opt-in, independent of `live_mic_meter_enabled`, see "Live camera preview and mic meter during RECORDING" below. |
+| `live_mic_meter_enabled` | `false` (default) for a frozen RECORDING-screen mic meter (last countdown reading). `true` for a live meter via a second `arecord` reader -- opt-in, independent of `live_preview_enabled`, see "Live camera preview and mic meter during RECORDING" below. |
 
 ## Camera compatibility (H.264 vs MJPEG)
 
@@ -348,59 +349,55 @@ Any subset works — an icon key you omit keeps the built-in drawing for that
 tip. Icons are scaled down to fit their slot while preserving aspect ratio
 (no cropping), so any reasonable square-ish PNG works.
 
-### Live camera preview and mic meter during RECORDING (opt-in)
+### Live camera preview and mic meter during RECORDING (opt-in, independent toggles)
 
 Only the `RECORDING` screen shows the camera (in a bordered panel, mirrored,
 matching the design) — every other screen is fully synthetic branded art.
-By default (`live_preview_enabled: false`) that screen shows the safe,
-proven behavior: the preview freezes at the last frame captured before
-ffmpeg takes the camera, and the mic meter freezes at the last reading from
-the countdown-time check. Set `"live_preview_enabled": true` in
-`config/booth.local.json` to make both genuinely live instead: the
-recording ffmpeg process writes a continuously-updated low-res preview
-JPEG and a periodic mic-level readout as *extra* outputs on the same
-process (no second process ever opens the camera or audio device, so this
-doesn't reintroduce the one-process-at-a-time conflicts this project
-already worked around elsewhere).
+By default (`live_preview_enabled: false`, `live_mic_meter_enabled: false`)
+that screen shows the safe, proven behavior: the preview freezes at the
+last frame captured before ffmpeg takes the camera, and the mic meter
+freezes at the last reading from the countdown-time check. These are two
+independent `bool` config fields — enable either, both, or neither.
 
-**This is opt-in, not the default, because a first real-hardware attempt
-at it caused problems** — the mic meter got choppier as a recording went
-on, and the added ffmpeg load contributed to audio breakup. Root cause:
-the level tap was printing all ~20 `astats` metrics every 100ms into a
-file that grew for the whole recording, and Python was re-reading and
-re-parsing that *entire, ever-growing* file on every render tick — cost
-that climbed the longer a recording ran. Fixed by having `astats` compute
-only the 2 metrics actually needed
-(`measure_perchannel=Peak_level+RMS_level:measure_overall=none`, not
-filtering at print time — two `ametadata=print` filters writing the same
-file was tried first and made ffmpeg hang), and by only ever reading the
-last ~4KB of that file in Python
-(`audio_levels.read_latest_live_level`), regardless of how long the
-recording has been running. The preview JPEG was also shrunk (480px→320px)
-and slowed (5fps→2fps) to cut its cost further. This fix has not yet been
-confirmed on real hardware, hence still opt-in rather than a restored
-default — flip it on, test a real recording, and report back.
+**Video preview** (`live_preview_enabled`): the recording ffmpeg process
+writes a continuously-updated low-res preview JPEG as an *extra* output on
+the same process (no second process ever opens the camera, so this doesn't
+reintroduce the one-process-at-a-time conflicts this project already
+worked around elsewhere). This is opt-in, not the default, because a first
+real-hardware attempt at it contributed to audio breakup. If enabling it
+ever causes audio breakup or lag, set `"live_preview_enabled": false`
+again first — that's the fastest way to confirm whether this feature is
+the cause before looking elsewhere.
 
-If you enable it and audio breakup or lag returns, set
-`"live_preview_enabled": false` again first — that's the fastest way to
-confirm whether this feature is the cause before looking elsewhere.
+**Mic meter** (`live_mic_meter_enabled`): a *second* `AudioLevelReader` —
+the exact same `arecord`-based mechanism already used on the Get Ready
+screen (see `media/audio_levels.py`) — started about a second after ffmpeg
+begins recording, so ffmpeg always gets first claim on the ALSA device.
+An earlier version of this feature instead tapped ffmpeg's own audio via
+an `astats`/`ametadata` filter to avoid a second process touching the
+device at all; that approach worked but had a real performance bug (it
+printed ~20 metrics every 100ms into an ever-growing file that was fully
+re-read every render tick, getting slower the longer a recording ran) and
+was replaced with the simpler `arecord` reuse per direct hardware
+feedback that the Get Ready screen's reader was already smooth. Whether
+the second `arecord` actually gets the device depends on your ALSA
+driver/config: if it can't open the device while ffmpeg is recording, it
+just fails to start and the meter stays frozen at the last countdown
+reading — the same degraded-but-safe behavior as when this toggle is off,
+never a blank or crashing meter. Check `logs/booth.log` for a `recording
+mic check could not start` or `recording mic check stopped early` warning
+to see which case you're in on your hardware.
 
-If the mic meter looks completely empty/blank the *entire* recording (not
-just quiet), check `logs/booth.log` around when you lifted the receiver —
-a `countdown mic check ... could not start` or `stopped early` warning
-there points at a real capture problem (wrong `audio_device`, `arecord`
-missing, device busy) separate from this feature.
+The RECORDING screen's meter widget is a vertical stacked bar regardless
+of which reading source is feeding it — no visual difference between the
+frozen and live cases beyond how often the level updates.
 
-**Why not just reuse the Get Ready screen's mic reader during RECORDING
-too?** That reader is a live `arecord` process, and ffmpeg holds the ALSA
-capture device exclusively while actually recording — the same
-one-process-at-a-time constraint that governs the camera. A second
-`arecord` running at the same time would either fail to open the device or
-depend on ALSA `dsnoop`/`dmix` sharing being configured on your specific
-hardware, which isn't something to assume. The `astats` tap used here gets
-the same live-level *result* without a second process: it reads the audio
-ffmpeg is already decoding for the recording itself, inside the same
-pipeline.
+If the mic meter looks completely empty/blank *before* recording even
+starts (on the Get Ready screen), check `logs/booth.log` around when you
+lifted the receiver — a `countdown mic check ... could not start` or
+`stopped early` warning there points at a real capture problem (wrong
+`audio_device`, `arecord` missing, device busy) separate from either
+RECORDING-screen toggle above.
 
 ## Fixing audio/video sync
 

@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — Split RECORDING mic meter into its own toggle, switch it to arecord
+
+Direct hardware feedback: "the mic level isn't fluid... the mic is more
+fluid in the get ready screen, we could just use that? add the
+arecord-based reader but vertical on the record screen." Replaced the
+`astats`/`ametadata` ffmpeg-tap mic mechanism (previous entry below) with
+a reuse of the exact `AudioLevelReader`/`arecord` mechanism already proven
+smooth on the Get Ready screen, and gave the mic meter its own config
+toggle so it's no longer tied to the video preview toggle.
+
+- **`config.py` / `config/booth.default.json`:** new independent
+  `live_mic_meter_enabled: bool` field (default `false`), validated the
+  same way as `live_preview_enabled` and fully decoupled from it -- either
+  can be on, off, or mixed.
+- **Removed the astats/ametadata mechanism entirely:**
+  `media/ffmpeg.py`'s `build_record_command()` no longer takes a
+  `live_level_path` parameter or extends the `-af` chain; `-af` is back to
+  the plain `aresample=async=1:first_pts=0`. `media/audio_levels.py`'s
+  `read_latest_live_level()` and its regex/tail-read constants are gone.
+  `media/recorder.py`'s `RecordingSession` no longer carries a
+  `live_level_path` field.
+- **`main.py`:** generalized the existing countdown-time mic-check thread
+  (`_start_mic_check`/`_mic_check_loop`) with a `context` label, a
+  `reset_latest` flag, and a `start_delay_seconds` parameter, then reused
+  it for RECORDING via a new `_start_recording_mic_meter()` call at the
+  end of `_start_recording()`, stopped via the existing `_stop_mic_check()`
+  at the start of `_stop_and_save()`.
+  - `start_delay_seconds=1.0`: waits a second after ffmpeg's own `Popen`
+    call before attempting to open the device, so ffmpeg always gets first
+    claim on the ALSA device.
+  - `reset_latest=False`: if the second `arecord` can't open the
+    already-busy device, the meter keeps showing the last countdown
+    reading instead of going blank for the whole recording -- graceful
+    degradation to exactly the old frozen behavior, not a new failure
+    mode.
+  - The countdown-phase gain-nudge flow (`_apply_mic_gain_nudge`) is
+    untouched and still only ever fed by the original countdown check --
+    the recording-phase reader's readings are never used to adjust gain,
+    preserving the rule that gain must not change once recording begins.
+- **No rendering change needed:** the RECORDING screen's meter widget was
+  already a vertical stacked bar; only the data source powering it
+  changed.
+- All corresponding tests updated/added across `test_config.py`,
+  `test_ffmpeg.py`, `test_audio_levels.py`, `test_recorder.py`, and
+  `test_main.py`. Full suite: 266 passed.
+- **Not yet confirmed on real hardware** -- same as the mechanism it
+  replaces, whether the second `arecord` actually gets the device depends
+  on the specific ALSA driver/config; if it can't, the meter simply stays
+  frozen at the last countdown reading rather than failing loudly.
+
 ## Unreleased — Fix live preview/mic meter perf bug, default it off
 
 Real-hardware feedback on the just-shipped live RECORDING preview/mic

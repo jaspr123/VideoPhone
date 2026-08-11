@@ -100,19 +100,25 @@ class BoothConfig:
     # are the same USB audio adapter these may look similar but are not
     # interchangeable. None (default) uses aplay's system default device.
     audio_playback_device: str | None = None
-    # Live feedback on the RECORDING screen: a low-fps, small preview JPEG
-    # and a periodic mic-level readout, both produced by the SAME recording
-    # ffmpeg process as extra lightweight outputs/filter taps (no second
-    # process ever opens the camera or audio device -- see media/ffmpeg.py
+    # Live camera preview on the RECORDING screen: a low-fps, small JPEG
+    # written by the SAME recording ffmpeg process as an extra output (no
+    # second process ever opens the camera -- see media/ffmpeg.py
     # is_live_video_copied()'s docstring on why that matters). Off by
-    # default: a first real-hardware pass at this (bigger preview frame,
-    # astats printing everything, unbounded file re-reads) caused audio
-    # breakup and a mic meter that got choppier over a recording -- fixed
-    # (see media/ffmpeg.py, media/audio_levels.py), but this stays opt-in
-    # until that fix is confirmed on real hardware rather than defaulting
-    # back on. If enabling this ever causes audio breakup again, disable it
-    # before touching anything else.
+    # default: a first real-hardware pass at this contributed to audio
+    # breakup. If enabling this ever causes audio breakup, disable it
+    # before touching anything else. Independent of live_mic_meter_enabled
+    # below -- these are two separate features that happen to both live on
+    # the RECORDING screen.
     live_preview_enabled: bool = False
+    # Live mic meter on the RECORDING screen: a second AudioLevelReader
+    # (same `arecord`-based mechanism as the countdown-time check, see
+    # media/audio_levels.py) started shortly after ffmpeg begins recording.
+    # Off by default -- whether this actually works depends on whether the
+    # ALSA device/driver allows a second concurrent reader while ffmpeg
+    # holds it for the recording itself; if not, arecord just fails to open
+    # and the meter falls back to the last countdown reading, same as when
+    # this is off. See main.py's _start_recording_mic_meter().
+    live_mic_meter_enabled: bool = False
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -235,6 +241,12 @@ class BoothConfig:
         if not isinstance(live_preview_enabled, bool):
             raise ConfigError(f"live_preview_enabled must be a boolean, got {live_preview_enabled!r}")
 
+        live_mic_meter_enabled = data.get("live_mic_meter_enabled", False)
+        if not isinstance(live_mic_meter_enabled, bool):
+            raise ConfigError(
+                f"live_mic_meter_enabled must be a boolean, got {live_mic_meter_enabled!r}"
+            )
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -257,6 +269,7 @@ class BoothConfig:
             theme_dir=(base_dir / theme_dir).resolve(),
             audio_playback_device=audio_playback_device,
             live_preview_enabled=live_preview_enabled,
+            live_mic_meter_enabled=live_mic_meter_enabled,
         )
 
     @classmethod

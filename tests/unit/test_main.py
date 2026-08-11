@@ -175,49 +175,22 @@ def test_read_live_preview_frame_falls_back_on_corrupt_read(tmp_path):
     np.testing.assert_array_equal(second, first)
 
 
-def test_read_live_level_reading_none_when_no_path(tmp_path):
-    app = _app(tmp_path)
-    assert app._read_live_level_reading() is None
-
-
-def test_read_live_level_reading_parses_file(tmp_path):
-    app = _app(tmp_path)
-    path = tmp_path / "levels.txt"
-    path.write_text("lavfi.astats.1.Peak_level=-10.0\nlavfi.astats.1.RMS_level=-20.0\n")
-    app._live_level_path = path
-
-    reading = app._read_live_level_reading()
-
-    assert reading is not None
-    assert reading.peak_dbfs == pytest.approx(-10.0)
-
-
-def test_read_live_level_reading_falls_back_to_last_known(tmp_path):
-    app = _app(tmp_path)
-    path = tmp_path / "levels.txt"
-    path.write_text("lavfi.astats.1.Peak_level=-10.0\nlavfi.astats.1.RMS_level=-20.0\n")
-    app._live_level_path = path
-    first = app._read_live_level_reading()
-    assert first is not None
-
-    path.write_text("")  # no complete pair yet -- must not report "no signal"
-
-    second = app._read_live_level_reading()
-
-    assert second is first
-
-
-def test_start_recording_sets_live_preview_and_level_paths_from_session(tmp_path, monkeypatch):
-    app = _app(tmp_path)
-    fake_session = RecordingSession(
+def _fake_session(tmp_path, **overrides) -> RecordingSession:
+    data = dict(
         session_id="20260101_000000_abcd1234",
         started_at=datetime.now(timezone.utc),
         live_output_path=tmp_path / "out.mp4",
         final_output_path=tmp_path / "out.mp4",
         needs_transcode=False,
-        live_preview_path=tmp_path / "preview.jpg",
-        live_level_path=tmp_path / "level.txt",
+        live_preview_path=None,
     )
+    data.update(overrides)
+    return RecordingSession(**data)
+
+
+def test_start_recording_sets_live_preview_path_from_session(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    fake_session = _fake_session(tmp_path, live_preview_path=tmp_path / "preview.jpg")
     monkeypatch.setattr(app.recorder, "start", lambda: fake_session)
     monkeypatch.setattr(main_module.time, "sleep", lambda seconds: None)
     app.state_machine.transition(BoothState.COUNTDOWN)
@@ -225,4 +198,60 @@ def test_start_recording_sets_live_preview_and_level_paths_from_session(tmp_path
     app._start_recording()
 
     assert app._live_preview_path == fake_session.live_preview_path
-    assert app._live_level_path == fake_session.live_level_path
+
+
+def test_start_recording_mic_meter_noop_when_disabled(tmp_path):
+    app = _app(tmp_path)  # live_mic_meter_enabled defaults to False
+    app._start_recording_mic_meter()
+    assert app._mic_check_thread is None
+
+
+def test_start_recording_mic_meter_starts_thread_when_enabled(tmp_path):
+    config = _config(tmp_path, live_mic_meter_enabled=True)
+    app = BoothApp(config, Theme.load(THEME_DIR), logging.getLogger("test"))
+
+    app._start_recording_mic_meter()
+    try:
+        assert app._mic_check_thread is not None
+        assert app._mic_check_thread.is_alive()
+    finally:
+        app._stop_mic_check()
+
+
+def test_start_recording_mic_meter_preserves_last_reading_until_fresh_one_arrives(tmp_path, monkeypatch):
+    # If the second arecord can never open the (already busy) device, the
+    # meter must keep showing the last countdown reading, not go blank.
+    config = _config(tmp_path, live_mic_meter_enabled=True)
+    app = BoothApp(config, Theme.load(THEME_DIR), logging.getLogger("test"))
+    stale_reading = _reading(-20.0)
+    app._latest_mic_reading = stale_reading
+
+    monkeypatch.setattr(main_module, "RECORDING_MIC_METER_START_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(
+        main_module.AudioLevelReader, "start",
+        lambda self: (_ for _ in ()).throw(main_module.MicrophoneError("device busy")),
+    )
+
+    app._start_recording_mic_meter()
+    app._mic_check_thread.join(timeout=2.0)
+
+    assert app._latest_mic_reading is stale_reading
+
+
+def test_stop_and_save_stops_recording_mic_meter(tmp_path, monkeypatch):
+    config = _config(tmp_path, live_mic_meter_enabled=True)
+    app = BoothApp(config, Theme.load(THEME_DIR), logging.getLogger("test"))
+    fake_session = _fake_session(tmp_path)
+    monkeypatch.setattr(app.recorder, "stop", lambda: fake_session)
+    monkeypatch.setattr(main_module, "validate_recording", lambda path: type(
+        "R", (), {"ok": True, "duration_seconds": 1.0, "size_bytes": 1, "reason": ""}
+    )())
+    monkeypatch.setattr(app, "_reopen_camera_with_retry", lambda: True)
+    app.state_machine.transition(BoothState.COUNTDOWN)
+    app.state_machine.transition(BoothState.RECORDING)
+    app._start_recording_mic_meter()
+    assert app._mic_check_thread is not None
+
+    app._stop_and_save()
+
+    assert app._mic_check_thread is None

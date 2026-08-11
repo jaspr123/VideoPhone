@@ -32,7 +32,6 @@ from video_guestbook.media.audio_levels import (
     LevelReading,
     MicrophoneError,
     classify_level,
-    read_latest_live_level,
 )
 from video_guestbook.media.audio_playback import play_sound_async
 from video_guestbook.media.mixer import MixerError, nudge_capture_gain
@@ -65,6 +64,17 @@ CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.3
 # Per the spec, gain is NOT adjusted continuously once recording begins.
 MIC_CHECK_CHUNK_MS = 100
 MIC_GAIN_NUDGE_PERCENT = 15
+
+# Live mic meter during RECORDING (config live_mic_meter_enabled, off by
+# default): a second AudioLevelReader on the same device ffmpeg is now
+# recording from -- see _start_recording_mic_meter(). Delayed this long
+# after ffmpeg's own Popen call before attempting to open the device
+# ourselves, so ffmpeg always gets first claim on it; if the ALSA
+# device/driver doesn't allow a second concurrent reader, our arecord
+# simply fails to open (safe -- the meter just falls back to the last
+# countdown reading), rather than risking ffmpeg's own capture losing the
+# device to us.
+RECORDING_MIC_METER_START_DELAY_SECONDS = 1.0
 
 # States during which ffmpeg owns the camera device; the preview must not
 # touch it and instead shows the last frame captured before recording began.
@@ -118,15 +128,16 @@ class BoothApp:
         self._mic_readings: list[LevelReading] = []
         self._latest_mic_reading: LevelReading | None = None
 
-        # Live RECORDING-screen feedback (config live_preview_enabled) --
-        # set from RecordingSession when a recording starts, read each
-        # render tick during RECORDING. See _read_live_preview_frame() and
-        # _read_live_level_reading().
+        # Live camera preview during RECORDING (config live_preview_enabled)
+        # -- set from RecordingSession when a recording starts, read each
+        # render tick during RECORDING. See _read_live_preview_frame().
+        # The RECORDING screen's live mic meter (config
+        # live_mic_meter_enabled) reuses _mic_check_thread/_latest_mic_
+        # reading above instead of a field of its own -- see
+        # _start_recording_mic_meter().
         self._live_preview_path: Path | None = None
         self._live_preview_last_mtime: float | None = None
         self._live_preview_last_frame = None
-        self._live_level_path: Path | None = None
-        self._live_level_last_reading: LevelReading | None = None
 
         self.hook_switch: HookSwitch | None = None
         self._hook_switch_was_lifted = False
@@ -243,18 +254,34 @@ class BoothApp:
         self._countdown_deadline = None
         self._enter_state(BoothState.READY)
 
-    def _start_mic_check(self) -> None:
-        """Begin sampling mic level in the background during the countdown."""
+    def _start_mic_check(
+        self, context: str = "countdown", reset_latest: bool = True, start_delay_seconds: float = 0.0
+    ) -> None:
+        """Begin sampling mic level in the background via a live arecord.
+
+        Used both during COUNTDOWN (the original, always-safe case -- the
+        ALSA device is free at that point) and, when config
+        live_mic_meter_enabled is on, again during RECORDING (see
+        _start_recording_mic_meter()) where the device is not free and
+        this may simply fail to open -- see start_delay_seconds and
+        reset_latest below.
+        """
         if self._mic_check_thread is not None:
             self._stop_mic_check()  # defensive: should not happen, but don't leak
         with self._mic_readings_lock:
             self._mic_readings = []
-            self._latest_mic_reading = None
+            if reset_latest:
+                self._latest_mic_reading = None
         self._mic_check_stop_event.clear()
-        self._mic_check_thread = threading.Thread(target=self._mic_check_loop, daemon=True)
+        self._mic_check_thread = threading.Thread(
+            target=self._mic_check_loop, args=(context, start_delay_seconds), daemon=True
+        )
         self._mic_check_thread.start()
 
-    def _mic_check_loop(self) -> None:
+    def _mic_check_loop(self, context: str = "countdown", start_delay_seconds: float = 0.0) -> None:
+        if start_delay_seconds > 0 and self._mic_check_stop_event.wait(start_delay_seconds):
+            return  # stopped before the delay even elapsed
+
         reader = AudioLevelReader(
             self.config.audio_device,
             self.config.audio_sample_rate,
@@ -264,14 +291,14 @@ class BoothApp:
         try:
             reader.start()
         except MicrophoneError as exc:
-            self.logger.warning("countdown mic check could not start: %s", exc)
+            self.logger.warning("%s mic check could not start: %s", context, exc)
             return
         try:
             while not self._mic_check_stop_event.is_set():
                 try:
                     reading = reader.read()
                 except MicrophoneError as exc:
-                    self.logger.warning("countdown mic check stopped early: %s", exc)
+                    self.logger.warning("%s mic check stopped early: %s", context, exc)
                     return
                 with self._mic_readings_lock:
                     self._mic_readings.append(reading)
@@ -280,10 +307,12 @@ class BoothApp:
             reader.stop()
 
     def _stop_mic_check(self) -> list[LevelReading]:
-        """Stop the background mic-check thread and return what it collected.
+        """Stop the background mic-reader thread and return what it collected.
 
-        Blocks until the underlying arecord process has actually exited, so
-        the ALSA device is free again before ffmpeg tries to open it.
+        Blocks until the underlying arecord process has actually exited.
+        Called both before ffmpeg opens the audio device to record (so it's
+        free) and to stop the RECORDING-phase meter (config
+        live_mic_meter_enabled) once the guest hangs up.
         """
         self._mic_check_stop_event.set()
         if self._mic_check_thread is not None:
@@ -369,11 +398,31 @@ class BoothApp:
         self._live_preview_path = session.live_preview_path
         self._live_preview_last_mtime = None
         self._live_preview_last_frame = None
-        self._live_level_path = session.live_level_path
-        self._live_level_last_reading = None
         self._enter_state(BoothState.RECORDING)
+        self._start_recording_mic_meter()
+
+    def _start_recording_mic_meter(self) -> None:
+        """Best-effort live mic meter during RECORDING (config
+        live_mic_meter_enabled, off by default): a second AudioLevelReader
+        on the device ffmpeg is now recording from.
+
+        reset_latest=False deliberately keeps whatever the countdown-time
+        check last saw as the displayed value until (if) this reader
+        produces a fresh one -- so if the ALSA device doesn't allow a
+        second concurrent reader and this never gets a reading, the meter
+        stays at the last known-good value instead of going blank for the
+        whole recording.
+        """
+        if not self.config.live_mic_meter_enabled:
+            return
+        self._start_mic_check(
+            context="recording",
+            reset_latest=False,
+            start_delay_seconds=RECORDING_MIC_METER_START_DELAY_SECONDS,
+        )
 
     def _stop_and_save(self) -> None:
+        self._stop_mic_check()  # no-op if live_mic_meter_enabled was off
         self._enter_state(BoothState.SAVING)
         try:
             session = self.recorder.stop()
@@ -477,19 +526,21 @@ class BoothApp:
         elif state == BoothState.RECORDING:
             elapsed = now - self._state_entered_at
             remaining = max(0, self.config.max_recording_seconds - int(elapsed))
-            # Live feedback when config.live_preview_enabled (the ffmpeg
-            # process recording also writes these -- see media/ffmpeg.py);
-            # falls back to the frozen pre-recording frame / last countdown
-            # reading when unavailable (disabled, or not written yet).
+            # Live camera preview when config.live_preview_enabled (the
+            # ffmpeg process recording also writes it -- see
+            # media/ffmpeg.py); falls back to the frozen pre-recording
+            # frame when disabled or not written yet. latest_mic_reading is
+            # live here too when config.live_mic_meter_enabled (see
+            # _start_recording_mic_meter()), otherwise it's just whatever
+            # the countdown-time check last saw, frozen.
             live_frame = self._read_live_preview_frame()
-            live_level = self._read_live_level_reading() or latest_mic_reading
             return self.renderer.render_recording(
                 now,
                 live_frame if live_frame is not None else frame,
                 int(elapsed),
                 remaining,
-                _mic_fraction(live_level),
-                bool(live_level and live_level.clipped),
+                _mic_fraction(latest_mic_reading),
+                bool(latest_mic_reading and latest_mic_reading.clipped),
             )
         elif state == BoothState.SAVING:
             return self.renderer.render_saving(now)
@@ -525,17 +576,6 @@ class BoothApp:
         self._live_preview_last_mtime = mtime
         self._live_preview_last_frame = frame
         return frame
-
-    def _read_live_level_reading(self) -> LevelReading | None:
-        """Latest live mic level during RECORDING, or the last known
-        reading if the file isn't there yet / momentarily unreadable."""
-        path = self._live_level_path
-        if path is None:
-            return None
-        reading = read_latest_live_level(path)
-        if reading is not None:
-            self._live_level_last_reading = reading
-        return self._live_level_last_reading
 
     def _read_frame(self):
         """Return the frame to display, honoring the camera/ffmpeg handoff."""
