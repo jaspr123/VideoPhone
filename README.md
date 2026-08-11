@@ -19,9 +19,9 @@ plus hook-switch integration from **Milestone 2**:
 - Graceful FFmpeg stop via stdin `q`
 - **Physical receiver hook switch** (lift to start, hang up to stop/save) AND
   Spacebar both work at the same time; `q`/`Esc` to quit
-- `READY`, `COUNTDOWN`, `RECORDING`, `SAVING`, `SAVED`, `ERROR` states, each
-  rendered as a themed, data-driven screen (see "Themed guest UI" below) --
-  not just plain text overlays
+- `READY`, `PREVIEW`, `COUNTDOWN`, `RECORDING`, `SAVING`, `SAVED`, `ERROR`
+  states, each rendered as a themed, data-driven screen (see "Themed guest
+  UI" below) -- not just plain text overlays
 - Detailed rotating logs (`logs/booth.log`)
 - Automated unit tests (state transitions, filenames, config validation,
   recording validation, theme loading, screen rendering)
@@ -124,9 +124,12 @@ python3 -m video_guestbook.main --config /path/to/custom.json
 ### Guest controls
 
 ```text
-Hook switch (lift)   -> start countdown, then recording (from READY)
-Hook switch (hang up) -> stop and save (from RECORDING), or cancel (from COUNTDOWN)
-Spacebar              -> same as lifting/hanging up, works at the same time as the hook switch
+Hook switch (lift)    -> live preview screen (from READY)
+Tap the record button
+  (or wait preview_seconds) -> countdown, then recording (from PREVIEW)
+Hook switch (hang up) -> stop and save (from RECORDING), or cancel (from PREVIEW/COUNTDOWN)
+Spacebar              -> same as lifting/hanging up/tapping record, works at
+                          the same time as the hook switch and touchscreen
 Q / Escape            -> quit the app
 ```
 
@@ -136,6 +139,15 @@ If the hook switch's GPIO can't be claimed at startup (not wired, `gpiozero`
 missing, pin already in use), the app logs a warning and falls back to
 Spacebar-only rather than crashing; check `logs/booth.log` for `hook switch`
 lines to see what happened.
+
+**PREVIEW screen (lift the receiver):** a live camera feed and mic meter so
+the guest can check themselves before recording starts, with a tap-to-record
+button on the touchscreen. Nothing is stuck on a missed tap: `preview_seconds`
+(default 8) auto-advances into COUNTDOWN on its own if nobody taps in time,
+same as everything else in this app that depends on hardware behaving --
+never a guest stuck on a screen forever (architecture rule 17). See
+"Why the live preview moved to PREVIEW" below for why this replaced an
+earlier design where RECORDING itself tried to show a live feed.
 
 ## Configuration
 
@@ -175,7 +187,8 @@ Key fields:
 | `audio_sample_rate`      | 8000/16000/22050/32000/44100/48000                  |
 | `audio_channels`         | 1 (mono) or 2 (stereo)                              |
 | `audio_bitrate`          | AAC bitrate, e.g. `160k`                            |
-| `countdown_seconds`      | Countdown length before recording starts            |
+| `countdown_seconds`      | Countdown length before recording starts (COUNTDOWN screen) |
+| `preview_seconds`        | How long the PREVIEW (live camera, tap-to-record) screen waits before auto-advancing into COUNTDOWN on its own, default `8`. See "Guest controls" above. |
 | `max_recording_seconds`  | Recording auto-stop limit                           |
 | `output_dir` / `log_dir` | Paths relative to the repository root               |
 | `preview_resolution` / `preview_fps` | Live preview quality (independent of recording quality) |
@@ -185,8 +198,7 @@ Key fields:
 | `recording_mode`         | `quality` (default, deferred background transcode, no audio-dropout risk) or `fast` (live transcode, immediately final). Only matters when `record_input_format` is `mjpeg`. See "Recording modes" below. |
 | `theme_dir`              | Path to a theme directory (default `themes/classic-walnut`), relative to the repository root. See "Themed guest UI" below. |
 | `audio_playback_device`  | ALSA *playback* device for prompt sounds (e.g. the pickup greeting), e.g. `plughw:CARD=Device,DEV=0`. `null`/omitted uses the system default output. Separate from `audio_device` (the microphone). |
-| `live_preview_enabled`   | `false` (default) for a frozen-frame RECORDING screen preview. `true` for a genuinely live camera preview -- opt-in, independent of `live_mic_meter_enabled`, see "Live camera preview and mic meter during RECORDING" below. |
-| `live_mic_meter_enabled` | `false` (default) for a frozen RECORDING-screen mic meter (last countdown reading). `true` for a live meter via a second `arecord` reader -- opt-in, independent of `live_preview_enabled`, see "Live camera preview and mic meter during RECORDING" below. |
+| `live_mic_meter_enabled` | `false` (default) for a frozen RECORDING-screen mic meter (last reading from before recording started). `true` for a live meter via a second `arecord` reader -- opt-in, see "RECORDING's mic meter" below. |
 
 ## Camera compatibility (H.264 vs MJPEG)
 
@@ -244,8 +256,8 @@ to watch the background queue's progress.
 
 ## Themed guest UI
 
-All 6 booth screens (`READY`, `COUNTDOWN`, `RECORDING`, `SAVING`, `SAVED`,
-`ERROR`) are rendered by `src/video_guestbook/ui/renderer.py` from a
+All 7 booth screens (`READY`, `PREVIEW`, `COUNTDOWN`, `RECORDING`, `SAVING`,
+`SAVED`, `ERROR`) are rendered by `src/video_guestbook/ui/renderer.py` from a
 **theme** — a directory of `theme.json` plus font and image assets, pointed
 to by `theme_dir` in config (default: `themes/classic-walnut`). Nothing
 visual is hard-coded into the renderer: colors, fonts, copy, and border art
@@ -349,55 +361,82 @@ Any subset works — an icon key you omit keeps the built-in drawing for that
 tip. Icons are scaled down to fit their slot while preserving aspect ratio
 (no cropping), so any reasonable square-ish PNG works.
 
-### Live camera preview and mic meter during RECORDING (opt-in, independent toggles)
+### PREVIEW screen: live camera + tap to record
 
-Only the `RECORDING` screen shows the camera (in a bordered panel, mirrored,
-matching the design) — every other screen is fully synthetic branded art.
-By default (`live_preview_enabled: false`, `live_mic_meter_enabled: false`)
-that screen shows the safe, proven behavior: the preview freezes at the
-last frame captured before ffmpeg takes the camera, and the mic meter
-freezes at the last reading from the countdown-time check. These are two
-independent `bool` config fields — enable either, both, or neither.
+`PREVIEW` and `RECORDING` are the only two screens that show the camera (in
+a bordered panel, mirrored, matching the design) — every other screen is
+fully synthetic branded art. They show it very differently, though:
+`PREVIEW`'s feed is genuinely live, and `RECORDING`'s is a frozen snapshot.
 
-**Video preview** (`live_preview_enabled`): the recording ffmpeg process
-writes a continuously-updated low-res preview JPEG as an *extra* output on
-the same process (no second process ever opens the camera, so this doesn't
-reintroduce the one-process-at-a-time conflicts this project already
-worked around elsewhere). This is opt-in, not the default, because a first
-real-hardware attempt at it contributed to audio breakup. If enabling it
-ever causes audio breakup or lag, set `"live_preview_enabled": false`
-again first — that's the fastest way to confirm whether this feature is
-the cause before looking elsewhere.
+This is deliberate, not a limitation. When a guest lifts the receiver, the
+camera hasn't been claimed by anything yet — `self.capture` (the OpenCV
+preview) is still open, exactly as it is on every other pre-recording
+screen — so `PREVIEW` can show a truly live feed with zero extra risk: no
+second process, no ffmpeg trickery, nothing that could compete with audio
+capture for CPU. The guest checks their framing, taps the on-screen record
+button (or just waits — `preview_seconds`, default `8`, auto-advances into
+`COUNTDOWN` on its own so a missed or miscalibrated touchscreen tap never
+strands anyone), then `COUNTDOWN` counts down, then `RECORDING` begins.
+`RECORDING` freezes on the last frame `PREVIEW` captured, right up until
+ffmpeg took the camera, and shows a "look here, hang up when you're done"
+caption over it.
 
-**Mic meter** (`live_mic_meter_enabled`): a *second* `AudioLevelReader` —
-the exact same `arecord`-based mechanism already used on the Get Ready
-screen (see `media/audio_levels.py`) — started about a second after ffmpeg
-begins recording, so ffmpeg always gets first claim on the ALSA device.
-An earlier version of this feature instead tapped ffmpeg's own audio via
-an `astats`/`ametadata` filter to avoid a second process touching the
-device at all; that approach worked but had a real performance bug (it
-printed ~20 metrics every 100ms into an ever-growing file that was fully
-re-read every render tick, getting slower the longer a recording ran) and
-was replaced with the simpler `arecord` reuse per direct hardware
-feedback that the Get Ready screen's reader was already smooth. Whether
-the second `arecord` actually gets the device depends on your ALSA
-driver/config: if it can't open the device while ffmpeg is recording, it
-just fails to start and the meter stays frozen at the last countdown
-reading — the same degraded-but-safe behavior as when this toggle is off,
-never a blank or crashing meter. Check `logs/booth.log` for a `recording
-mic check could not start` or `recording mic check stopped early` warning
-to see which case you're in on your hardware.
+**This replaced an earlier design** where `RECORDING` itself tried to show
+a *live* feed, via a second ffmpeg output (a low-fps JPEG written as an
+extra `-map` on the same recording process). That approach went through
+several real-hardware rounds — a genuine performance bug (a companion mic
+tap re-parsing an ever-growing file every render tick), then, even after
+fixing that, real feedback that any load added during `RECORDING` at all
+was risky ("the live preview seems to be messing everything up"). Moving
+the live feed to before `RECORDING` even starts, instead of trying to make
+it safer during `RECORDING`, removes that entire category of risk instead
+of chasing it — `RECORDING`'s ffmpeg process now runs exactly as plain as
+it did before any of this existed. If you're digging through git history
+and see `live_preview_enabled` or an `-update 1` JPEG output in
+`media/ffmpeg.py`, that's what it was for; it's gone now.
 
-The RECORDING screen's meter widget is a vertical stacked bar regardless
+Touch calibration on the actual Waveshare touchscreen hasn't been verified
+on hardware yet — `preview_seconds` is the safety net if a tap doesn't land
+where expected on your specific setup, and Spacebar is always an equivalent
+in development (`handle_key`'s `PREVIEW` branch) or as a permanent backup
+(architecture rule 11).
+
+### RECORDING's mic meter (opt-in)
+
+By default (`live_mic_meter_enabled: false`) the `RECORDING` screen's mic
+meter freezes at the last reading from before recording started (same
+reading `PREVIEW` and `COUNTDOWN` were already showing live). Set
+`"live_mic_meter_enabled": true` to make it live during `RECORDING` too, via
+a *second* `AudioLevelReader` — the exact same `arecord`-based mechanism
+already used on `PREVIEW`/`COUNTDOWN` (see `media/audio_levels.py`) —
+started about a second after ffmpeg begins recording, so ffmpeg always gets
+first claim on the ALSA device.
+
+An earlier version of this feature instead tapped ffmpeg's own audio via an
+`astats`/`ametadata` filter to avoid a second process touching the device at
+all; that approach worked but had a real performance bug (it printed ~20
+metrics every 100ms into an ever-growing file that was fully re-read every
+render tick, getting slower the longer a recording ran) and was replaced
+with the simpler `arecord` reuse per direct hardware feedback that the
+pre-recording reader was already smooth. Whether the second `arecord`
+actually gets the device depends on your ALSA driver/config: if it can't
+open the device while ffmpeg is recording, it just fails to start and the
+meter stays frozen at the last pre-recording reading — the same
+degraded-but-safe behavior as when this toggle is off, never a blank or
+crashing meter. Check `logs/booth.log` for a `recording mic check could not
+start` or `recording mic check stopped early` warning to see which case
+you're in on your hardware.
+
+The `RECORDING` screen's meter widget is a vertical stacked bar regardless
 of which reading source is feeding it — no visual difference between the
 frozen and live cases beyond how often the level updates.
 
 If the mic meter looks completely empty/blank *before* recording even
-starts (on the Get Ready screen), check `logs/booth.log` around when you
+starts (on `PREVIEW`/`COUNTDOWN`), check `logs/booth.log` around when you
 lifted the receiver — a `countdown mic check ... could not start` or
 `stopped early` warning there points at a real capture problem (wrong
-`audio_device`, `arecord` missing, device busy) separate from either
-RECORDING-screen toggle above.
+`audio_device`, `arecord` missing, device busy) separate from
+`live_mic_meter_enabled` above.
 
 ## Fixing audio/video sync
 

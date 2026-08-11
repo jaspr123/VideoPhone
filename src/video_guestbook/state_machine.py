@@ -1,7 +1,16 @@
 """Booth state machine.
 
-States follow PROJECT_SPEC.md section 23 (Milestone 1 scope): READY,
-COUNTDOWN, RECORDING, SAVING, SAVED and ERROR.
+States follow PROJECT_SPEC.md section 23 (Milestone 1 scope) plus PREVIEW,
+added later: READY, PREVIEW, COUNTDOWN, RECORDING, SAVING, SAVED and ERROR.
+
+PREVIEW sits between READY and COUNTDOWN: the guest lifts the receiver into
+a live camera preview (the camera is free -- ffmpeg hasn't claimed it yet,
+see main.py's module docstring) and either taps the on-screen record button
+or waits out an auto-advance timer before the numeric COUNTDOWN begins. This
+replaced an earlier design where RECORDING itself tried to show a live
+preview via a second ffmpeg output, which caused real audio-breakup trouble
+on hardware -- see CHANGELOG.md. Moving the live preview to PREVIEW (before
+ffmpeg ever opens the camera) removes that conflict entirely.
 """
 
 from __future__ import annotations
@@ -12,6 +21,7 @@ from enum import Enum
 
 class BoothState(str, Enum):
     READY = "READY"
+    PREVIEW = "PREVIEW"
     COUNTDOWN = "COUNTDOWN"
     RECORDING = "RECORDING"
     SAVING = "SAVING"
@@ -21,11 +31,14 @@ class BoothState(str, Enum):
 
 # Architecture rule 12: guest input must be ignored during SAVING.
 GUEST_INPUT_STATES = frozenset(
-    {BoothState.READY, BoothState.COUNTDOWN, BoothState.RECORDING}
+    {BoothState.READY, BoothState.PREVIEW, BoothState.COUNTDOWN, BoothState.RECORDING}
 )
 
 VALID_TRANSITIONS: dict[BoothState, frozenset[BoothState]] = {
-    BoothState.READY: frozenset({BoothState.COUNTDOWN, BoothState.ERROR}),
+    BoothState.READY: frozenset({BoothState.PREVIEW, BoothState.ERROR}),
+    BoothState.PREVIEW: frozenset(
+        {BoothState.COUNTDOWN, BoothState.READY, BoothState.ERROR}
+    ),
     BoothState.COUNTDOWN: frozenset(
         {BoothState.RECORDING, BoothState.READY, BoothState.ERROR}
     ),

@@ -41,29 +41,6 @@ def find_ffprobe() -> str:
 _SOFTWARE_ENCODE_PRESET = "ultrafast"
 _SOFTWARE_ENCODE_BITRATE = "4M"
 
-# Live camera preview for the RECORDING screen (config live_preview_enabled,
-# off by default): a low-fps, small JPEG snapshot written as an *extra*
-# output on this same ffmpeg process -- never a second process opening the
-# camera. Verified against real ffmpeg (dual `-map` of the same input
-# stream, one `-c:v copy` and one filtered, plus the existing
-# thread_queue_size/wallclock/itsoffset flags together) using a raw
-# elementary-stream source (matching how v4l2 delivers frames -- no
-# pre-existing container timestamps to conflict with
-# -use_wallclock_as_timestamps, unlike a pre-muxed file). Deliberately
-# small/low-fps to keep the added CPU cost well below a second real-time
-# encode; a first real-hardware pass used a bigger/faster preview and
-# contributed to audio breakup (see CHANGELOG.md), hence these conservative
-# defaults.
-#
-# The RECORDING screen's mic meter used to be a second ffmpeg output too
-# (an astats/ametadata tap), but that approach is gone -- see
-# main.py's _start_recording_mic_meter() and CHANGELOG.md for why it was
-# replaced with a second AudioLevelReader instead.
-_LIVE_PREVIEW_WIDTH = 320
-_LIVE_PREVIEW_FPS = 2
-_LIVE_PREVIEW_JPEG_QUALITY = "8"  # ffmpeg -q:v scale: 2 (best) .. 31 (worst)
-
-
 def is_live_video_copied(config: BoothConfig) -> bool:
     """True if the live recording command copies video with no re-encode.
 
@@ -86,11 +63,7 @@ def needs_deferred_transcode(config: BoothConfig) -> bool:
     return config.record_input_format == "mjpeg" and config.recording_mode == "quality"
 
 
-def build_record_command(
-    config: BoothConfig,
-    output_path: Path,
-    live_preview_path: Path | None = None,
-) -> list[str]:
+def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
     """Build the ffmpeg argv for recording camera + microphone.
 
     See is_live_video_copied() for when video is copied vs. software
@@ -115,12 +88,13 @@ def build_record_command(
     positive values delay the video input, negative values delay the audio
     input. It has no effect when 0 (the default).
 
-    live_preview_path (optional, config live_preview_enabled): when given,
-    this same process also writes a continuously-overwritten low-fps
-    preview JPEG, so the RECORDING screen can show a real live camera
-    preview without a second process ever touching the camera. See the
-    module-level comment above _LIVE_PREVIEW_WIDTH for how this was
-    validated.
+    RECORDING's camera panel does not need a live feed from this process:
+    the guest already saw themselves live on the PREVIEW screen (before
+    this process ever started -- see state_machine.py), and RECORDING just
+    keeps showing the last frame captured there. An earlier version of this
+    function wrote a second, low-fps preview JPEG as an extra output for
+    exactly that purpose; it's gone now that PREVIEW covers the need
+    without a second ffmpeg output. See CHANGELOG.md.
     """
     ffmpeg = find_ffmpeg()
     width, height = config.record_width_height
@@ -198,19 +172,6 @@ def build_record_command(
             str(output_path),
         ]
     )
-
-    if live_preview_path is not None:
-        command += [
-            "-map",
-            "0:v:0",
-            "-vf",
-            f"fps={_LIVE_PREVIEW_FPS},scale={_LIVE_PREVIEW_WIDTH}:-2",
-            "-update",
-            "1",
-            "-q:v",
-            _LIVE_PREVIEW_JPEG_QUALITY,
-            str(live_preview_path),
-        ]
 
     return command
 

@@ -1,15 +1,24 @@
 """Guest-facing booth application entry point.
 
 Full-screen MJPEG preview, hook-switch AND Spacebar start/stop (both work
-at once per architecture rule 11), countdown, recording via ffmpeg, save
-validation, and return to READY. Themes, admin UI and cloud sync are
-intentionally not implemented yet (see PROJECT_SPEC.md section 23).
+at once per architecture rule 11), a live-preview "get ready" screen with
+tap-to-record, countdown, recording via ffmpeg, save validation, and return
+to READY. Themes, admin UI and cloud sync are intentionally not implemented
+yet (see PROJECT_SPEC.md section 23).
 
 Camera/ffmpeg handoff: the USB webcam can only be held open by one process
 at a time. This mirrors the confirmed working prototype (legacy/booth.py):
 the OpenCV preview capture is released just before ffmpeg opens the camera
 device for recording, and reopened (with retries) once ffmpeg exits. Do not
 read frames from self.capture while a recording is in progress.
+
+PREVIEW and COUNTDOWN both happen before ffmpeg ever touches the camera, so
+self.capture stays open and its frames genuinely are live on both those
+screens -- see state_machine.py's module docstring for why PREVIEW exists
+as its own state (it replaced an earlier design where RECORDING itself
+tried to show a live preview via a second ffmpeg output, which caused real
+audio-breakup trouble on hardware; see CHANGELOG.md). RECORDING only ever
+shows the last frame captured before ffmpeg took over.
 """
 
 from __future__ import annotations
@@ -128,16 +137,14 @@ class BoothApp:
         self._mic_readings: list[LevelReading] = []
         self._latest_mic_reading: LevelReading | None = None
 
-        # Live camera preview during RECORDING (config live_preview_enabled)
-        # -- set from RecordingSession when a recording starts, read each
-        # render tick during RECORDING. See _read_live_preview_frame().
-        # The RECORDING screen's live mic meter (config
-        # live_mic_meter_enabled) reuses _mic_check_thread/_latest_mic_
-        # reading above instead of a field of its own -- see
+        # PREVIEW auto-advance (config preview_seconds): a guest who never
+        # taps the record button (or whose tap the touchscreen missed)
+        # still isn't stuck on the live-preview screen forever. Mirrors
+        # _countdown_deadline below. The RECORDING screen's live mic meter
+        # (config live_mic_meter_enabled) reuses _mic_check_thread/
+        # _latest_mic_reading above instead of a field of its own -- see
         # _start_recording_mic_meter().
-        self._live_preview_path: Path | None = None
-        self._live_preview_last_mtime: float | None = None
-        self._live_preview_last_frame = None
+        self._preview_deadline: float | None = None
 
         self.hook_switch: HookSwitch | None = None
         self._hook_switch_was_lifted = False
@@ -181,13 +188,15 @@ class BoothApp:
         state = self.state_machine.state
         if just_lifted and state == BoothState.READY:
             self.logger.info("hook switch: receiver lifted")
-            self._start_countdown()
+            self._start_preview()
         elif just_replaced and state == BoothState.RECORDING:
             self.logger.info("hook switch: receiver replaced")
             self._stop_and_save()
-        elif just_replaced and state == BoothState.COUNTDOWN:
-            self.logger.info("hook switch: receiver replaced during countdown, cancelling")
-            self._cancel_countdown()
+        elif just_replaced and state in (BoothState.PREVIEW, BoothState.COUNTDOWN):
+            self.logger.info(
+                "hook switch: receiver replaced during %s, cancelling", state.value
+            )
+            self._cancel_to_ready()
 
     def open_camera(self) -> None:
         self.capture = _configure_capture(self.config)
@@ -227,11 +236,25 @@ class BoothApp:
         self.state_machine.transition(new_state)
         self._state_entered_at = time.monotonic()
 
-    def _start_countdown(self) -> None:
-        self._enter_state(BoothState.COUNTDOWN)
-        self._countdown_deadline = time.monotonic() + self.config.countdown_seconds
+    def _start_preview(self) -> None:
+        """Receiver just lifted: live camera + mic meter, guest checks
+        themselves and either taps Record or waits out preview_seconds
+        (see tick()'s PREVIEW branch and _on_mouse()). The camera is
+        genuinely live here -- ffmpeg hasn't opened it yet -- so the mic
+        check can safely start now too and just keep running through
+        COUNTDOWN until _start_recording() stops it."""
+        self._enter_state(BoothState.PREVIEW)
+        self._preview_deadline = time.monotonic() + self.config.preview_seconds
         self._start_mic_check()
         self._play_pickup_greeting()
+
+    def _start_countdown(self) -> None:
+        """Guest tapped Record (or preview_seconds ran out): begin the
+        numeric countdown. The mic check keeps running from _start_preview()
+        uninterrupted -- nothing to start or stop here."""
+        self._enter_state(BoothState.COUNTDOWN)
+        self._preview_deadline = None
+        self._countdown_deadline = time.monotonic() + self.config.countdown_seconds
 
     def _play_pickup_greeting(self) -> None:
         """Best-effort spoken prompt on pickup (PROJECT_SPEC.md section 6,
@@ -245,12 +268,14 @@ class BoothApp:
             pickup_sound, device=self.config.audio_playback_device, logger=self.logger
         )
 
-    def _cancel_countdown(self) -> None:
-        """Receiver replaced before the countdown finished -- spec section 20
-        explicitly lists "receiver lifted and immediately replaced" as a
-        venue-simulation test case. No recording was started, so just
-        return to READY without touching the recorder."""
+    def _cancel_to_ready(self) -> None:
+        """Receiver replaced during PREVIEW or COUNTDOWN, before recording
+        started -- spec section 20 explicitly lists "receiver lifted and
+        immediately replaced" as a venue-simulation test case. No recording
+        was started, so just return to READY without touching the
+        recorder."""
         self._stop_mic_check()
+        self._preview_deadline = None
         self._countdown_deadline = None
         self._enter_state(BoothState.READY)
 
@@ -395,9 +420,6 @@ class BoothApp:
             session.live_output_path,
             " (raw, will transcode after)" if session.needs_transcode else "",
         )
-        self._live_preview_path = session.live_preview_path
-        self._live_preview_last_mtime = None
-        self._live_preview_last_frame = None
         self._enter_state(BoothState.RECORDING)
         self._start_recording_mic_meter()
 
@@ -474,11 +496,34 @@ class BoothApp:
             return True
 
         if self.state_machine.state == BoothState.READY:
+            self._start_preview()
+        elif self.state_machine.state == BoothState.PREVIEW:
             self._start_countdown()
         elif self.state_machine.state == BoothState.RECORDING:
             self._stop_and_save()
 
         return True
+
+    def _on_mouse(self, event: int, x: int, y: int, flags: int, userdata: object) -> None:
+        """Touch/click handling for the PREVIEW screen's record button.
+
+        Best-effort (rule 17): if record_button_rect hasn't been set yet
+        (no PREVIEW frame rendered yet) this just does nothing rather than
+        raising. preview_seconds' auto-advance is the safety net if a
+        touchscreen's coordinates don't line up with this rect on a given
+        piece of hardware -- see config.py.
+        """
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if self.state_machine.state != BoothState.PREVIEW:
+            return
+        rect = self.renderer.record_button_rect
+        if rect is None:
+            return
+        x0, y0, x1, y1 = rect
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            self.logger.info("record button tapped")
+            self._start_countdown()
 
     def tick(self) -> None:
         """Advance time-based transitions (countdown expiry, auto-stop, timeouts)."""
@@ -486,7 +531,12 @@ class BoothApp:
 
         state = self.state_machine.state
 
-        if state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
+        if state == BoothState.PREVIEW and self._preview_deadline is not None:
+            if time.monotonic() >= self._preview_deadline:
+                self.logger.info("preview_seconds elapsed with no tap; auto-advancing")
+                self._start_countdown()
+
+        elif state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
             if time.monotonic() >= self._countdown_deadline:
                 self._start_recording()
 
@@ -505,9 +555,9 @@ class BoothApp:
     def render(self, frame):
         """Build the full themed display frame for the current state.
 
-        Only RECORDING uses the live/frozen camera frame (in a bordered
-        panel, per the theme); every other screen is fully synthetic
-        branded art, matching the "Guestbook Kiosk" design (see
+        Only PREVIEW (live) and RECORDING (frozen) use the camera frame, in
+        a bordered panel per the theme; every other screen is fully
+        synthetic branded art, matching the "Guestbook Kiosk" design (see
         ui/renderer.py and CHANGELOG.md).
         """
         state = self.state_machine.state
@@ -516,7 +566,16 @@ class BoothApp:
         with self._mic_readings_lock:
             latest_mic_reading = self._latest_mic_reading
 
-        if state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
+        if state == BoothState.PREVIEW:
+            # frame is genuinely live here -- ffmpeg hasn't opened the
+            # camera yet, see the module docstring above.
+            return self.renderer.render_preview(
+                now,
+                frame,
+                _mic_fraction(latest_mic_reading),
+                bool(latest_mic_reading and latest_mic_reading.clipped),
+            )
+        elif state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
             remaining = max(0.0, self._countdown_deadline - now)
             mic_status = latest_mic_reading.status if latest_mic_reading is not None else None
             mic_fraction = _mic_fraction(latest_mic_reading) if latest_mic_reading is not None else None
@@ -526,17 +585,15 @@ class BoothApp:
         elif state == BoothState.RECORDING:
             elapsed = now - self._state_entered_at
             remaining = max(0, self.config.max_recording_seconds - int(elapsed))
-            # Live camera preview when config.live_preview_enabled (the
-            # ffmpeg process recording also writes it -- see
-            # media/ffmpeg.py); falls back to the frozen pre-recording
-            # frame when disabled or not written yet. latest_mic_reading is
-            # live here too when config.live_mic_meter_enabled (see
-            # _start_recording_mic_meter()), otherwise it's just whatever
-            # the countdown-time check last saw, frozen.
-            live_frame = self._read_live_preview_frame()
+            # frame is the last frame captured on the PREVIEW screen, frozen
+            # the moment ffmpeg took the camera -- see the module docstring
+            # above. latest_mic_reading is live here too when config.
+            # live_mic_meter_enabled (see _start_recording_mic_meter()),
+            # otherwise it's just whatever the countdown-time check last
+            # saw, frozen.
             return self.renderer.render_recording(
                 now,
-                live_frame if live_frame is not None else frame,
+                frame,
                 int(elapsed),
                 remaining,
                 _mic_fraction(latest_mic_reading),
@@ -550,32 +607,6 @@ class BoothApp:
             return self.renderer.render_error(now, self._last_result_reason)
 
         return self.renderer.render_ready(now)
-
-    def _read_live_preview_frame(self):
-        """Latest live preview frame during RECORDING, or None if unavailable.
-
-        Reads the JPEG ffmpeg keeps overwriting (config live_preview_enabled;
-        see media/ffmpeg.py). Skips re-decoding when the file's mtime hasn't
-        changed since the last read, and falls back to the last
-        successfully-decoded frame on a transient read-mid-write failure --
-        never raises, never blocks waiting for a fresh frame.
-        """
-        path = self._live_preview_path
-        if path is None:
-            return None
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return self._live_preview_last_frame
-        if mtime == self._live_preview_last_mtime:
-            return self._live_preview_last_frame
-
-        frame = cv2.imread(str(path))
-        if frame is None:
-            return self._live_preview_last_frame
-        self._live_preview_last_mtime = mtime
-        self._live_preview_last_frame = frame
-        return frame
 
     def _read_frame(self):
         """Return the frame to display, honoring the camera/ffmpeg handoff."""
@@ -602,6 +633,7 @@ class BoothApp:
         self.transcode_queue.start()
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
         try:
             running = True
             while running:

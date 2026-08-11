@@ -14,6 +14,7 @@ def test_initial_state_is_ready():
 
 def test_full_happy_path_transition_sequence():
     sm = StateMachine()
+    sm.transition(BoothState.PREVIEW)
     sm.transition(BoothState.COUNTDOWN)
     sm.transition(BoothState.RECORDING)
     sm.transition(BoothState.SAVING)
@@ -24,6 +25,7 @@ def test_full_happy_path_transition_sequence():
 
 def test_error_path_from_recording():
     sm = StateMachine()
+    sm.transition(BoothState.PREVIEW)
     sm.transition(BoothState.COUNTDOWN)
     sm.transition(BoothState.RECORDING)
     sm.transition(BoothState.ERROR)
@@ -35,9 +37,11 @@ def test_error_path_from_recording():
 @pytest.mark.parametrize(
     "start,target",
     [
+        (BoothState.READY, BoothState.COUNTDOWN),
         (BoothState.READY, BoothState.RECORDING),
         (BoothState.READY, BoothState.SAVING),
         (BoothState.READY, BoothState.SAVED),
+        (BoothState.PREVIEW, BoothState.RECORDING),
         (BoothState.COUNTDOWN, BoothState.SAVED),
         (BoothState.SAVING, BoothState.RECORDING),
         (BoothState.SAVED, BoothState.RECORDING),
@@ -55,7 +59,8 @@ def test_invalid_transitions_raise(start, target):
 
 def test_can_transition_matches_transition_behavior():
     sm = StateMachine()
-    assert sm.can_transition(BoothState.COUNTDOWN) is True
+    assert sm.can_transition(BoothState.PREVIEW) is True
+    assert sm.can_transition(BoothState.COUNTDOWN) is False
     assert sm.can_transition(BoothState.RECORDING) is False
 
 
@@ -63,6 +68,7 @@ def test_can_transition_matches_transition_behavior():
     "state,expected",
     [
         (BoothState.READY, True),
+        (BoothState.PREVIEW, True),
         (BoothState.COUNTDOWN, True),
         (BoothState.RECORDING, True),
         (BoothState.SAVING, False),

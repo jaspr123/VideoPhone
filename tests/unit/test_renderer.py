@@ -48,6 +48,29 @@ def test_render_ready(renderer):
     _assert_frame(renderer.render_ready(time.monotonic()))
 
 
+def test_render_preview_without_frame(renderer):
+    _assert_frame(renderer.render_preview(time.monotonic(), None, 0.0, False))
+
+
+def test_render_preview_sets_record_button_rect(renderer):
+    assert renderer.record_button_rect is None
+    renderer.render_preview(time.monotonic(), None, 0.0, False)
+    x0, y0, x1, y1 = renderer.record_button_rect
+    assert 0 <= x0 < x1 <= 1024
+    assert 0 <= y0 < y1 <= 576
+
+
+@pytest.mark.parametrize("shape", [(720, 1280, 3), (480, 640, 3), (1080, 1080, 3)])
+def test_render_preview_with_various_frame_aspect_ratios(renderer, shape):
+    frame = np.random.randint(0, 255, shape, dtype=np.uint8)
+    _assert_frame(renderer.render_preview(time.monotonic(), frame, 0.6, True))
+
+
+@pytest.mark.parametrize("fraction", [-1.0, 0.0, 0.5, 1.0, 2.0])
+def test_render_preview_mic_fraction_out_of_range_does_not_raise(renderer, fraction):
+    _assert_frame(renderer.render_preview(time.monotonic(), None, fraction, False))
+
+
 def test_render_countdown_without_mic(renderer):
     _assert_frame(renderer.render_countdown(time.monotonic(), 2.0, 3, None, None))
 

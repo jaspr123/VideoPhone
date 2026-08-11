@@ -207,7 +207,7 @@ def test_needs_deferred_transcode(tmp_path):
     )
 
 
-def test_no_live_preview_by_default(tmp_path):
+def test_no_live_preview_output(tmp_path):
     config = make_config(tmp_path)
     output_path = tmp_path / "recordings" / "session.mp4"
 
@@ -215,37 +215,6 @@ def test_no_live_preview_by_default(tmp_path):
 
     assert "-update" not in command
     assert command[command.index("-af") + 1] == "aresample=async=1:first_pts=0"
-
-
-def test_live_preview_path_adds_second_low_fps_output(tmp_path):
-    config = make_config(tmp_path)
-    output_path = tmp_path / "recordings" / "session.mp4"
-    preview_path = tmp_path / "logs" / "live_preview.jpg"
-
-    command = ffmpeg_module.build_record_command(config, output_path, live_preview_path=preview_path)
-
-    # Same source stream mapped a second time -- still two -map 0:v:0.
-    map_indices = [i for i, arg in enumerate(command) if arg == "-map"]
-    mapped_values = [command[i + 1] for i in map_indices]
-    assert mapped_values.count("0:v:0") == 2
-    assert mapped_values.count("1:a:0") == 1
-    assert "-update" in command
-    assert command[command.index("-update") + 1] == "1"
-    assert command[-1] == str(preview_path)
-    # Main output is untouched -- still -c:v copy for this h264 config.
-    assert command[command.index("-c:v") + 1] == "copy"
-
-
-def test_live_preview_scale_and_fps_are_conservative(tmp_path):
-    config = make_config(tmp_path)
-    output_path = tmp_path / "recordings" / "session.mp4"
-    preview_path = tmp_path / "logs" / "live_preview.jpg"
-
-    command = ffmpeg_module.build_record_command(config, output_path, live_preview_path=preview_path)
-
-    vf_value = command[command.index("-vf") + 1]
-    assert "fps=" in vf_value
-    assert "scale=" in vf_value
 
 
 def test_build_transcode_command(tmp_path):

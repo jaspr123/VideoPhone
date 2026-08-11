@@ -145,22 +145,6 @@ def test_audio_playback_device_rejects_empty_string():
         BoothConfig.from_dict(valid_config_dict(audio_playback_device=""))
 
 
-def test_live_preview_enabled_defaults_to_false():
-    config = BoothConfig.from_dict(valid_config_dict())
-    assert config.live_preview_enabled is False
-
-
-def test_live_preview_enabled_can_be_turned_on():
-    config = BoothConfig.from_dict(valid_config_dict(live_preview_enabled=True))
-    assert config.live_preview_enabled is True
-
-
-@pytest.mark.parametrize("value", ["true", 1, None])
-def test_live_preview_enabled_rejects_non_bool(value):
-    with pytest.raises(ConfigError, match="live_preview_enabled"):
-        BoothConfig.from_dict(valid_config_dict(live_preview_enabled=value))
-
-
 def test_live_mic_meter_enabled_defaults_to_false():
     config = BoothConfig.from_dict(valid_config_dict())
     assert config.live_mic_meter_enabled is False
@@ -171,18 +155,26 @@ def test_live_mic_meter_enabled_can_be_turned_on():
     assert config.live_mic_meter_enabled is True
 
 
-def test_live_mic_meter_enabled_is_independent_of_live_preview_enabled():
-    config = BoothConfig.from_dict(
-        valid_config_dict(live_preview_enabled=False, live_mic_meter_enabled=True)
-    )
-    assert config.live_preview_enabled is False
-    assert config.live_mic_meter_enabled is True
-
-
 @pytest.mark.parametrize("value", ["true", 1, None])
 def test_live_mic_meter_enabled_rejects_non_bool(value):
     with pytest.raises(ConfigError, match="live_mic_meter_enabled"):
         BoothConfig.from_dict(valid_config_dict(live_mic_meter_enabled=value))
+
+
+def test_preview_seconds_defaults_to_eight():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.preview_seconds == 8
+
+
+def test_preview_seconds_can_be_overridden():
+    config = BoothConfig.from_dict(valid_config_dict(preview_seconds=15))
+    assert config.preview_seconds == 15
+
+
+@pytest.mark.parametrize("value", [0, -1, "8", 8.5])
+def test_preview_seconds_rejects_invalid_values(value):
+    with pytest.raises(ConfigError, match="preview_seconds"):
+        BoothConfig.from_dict(valid_config_dict(preview_seconds=value))
 
 
 def test_missing_key_raises():

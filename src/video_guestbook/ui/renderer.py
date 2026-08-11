@@ -67,6 +67,12 @@ class Renderer:
         self._couple_photo = self._load_couple_photo() if theme.show_couple_photo else None
         self._custom_icons = self._load_custom_icons()
         self._pop_state: tuple[object, float] | None = None
+        # Updated on every render_preview() call to the on-screen "tap to
+        # record" button's pixel rect in this renderer's own w x h space, so
+        # main.py can hit-test raw mouse/touch callback coordinates against
+        # it without duplicating this layout math. None until the first
+        # PREVIEW frame is drawn.
+        self.record_button_rect: tuple[int, int, int, int] | None = None
 
     # ── one-time asset preparation ──────────────────────────────────
     def _load_background(self) -> Image.Image:
@@ -226,6 +232,74 @@ class Renderer:
             fill = _rgba(color) if lit_segment else self._blend_full(panel_bg, color, int(255 * _UNLIT_OPACITY))
             draw.rounded_rectangle([x, seg_y, x + width, seg_y + seg_h], radius=2, fill=fill)
 
+    def _camera_and_meter_row(
+        self,
+        canvas: Image.Image,
+        draw: ImageDraw.ImageDraw,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        camera_frame_bgr: np.ndarray | None,
+        mic_fraction: float,
+        mic_clipped: bool,
+        placeholder_text: str,
+    ) -> tuple[float, float, float, float]:
+        """Bordered/mirrored camera panel + vertical mic meter, spanning the
+        rect (x0, y0, x1, y1). Shared between RECORDING and PREVIEW -- the
+        two screens that ever show the live/frozen camera feed (see
+        state_machine.py's module docstring for why PREVIEW exists).
+        Returns the camera panel's own (x0, y0, w, h) so callers can layer
+        something on top of it (e.g. RECORDING's "look here" caption).
+        """
+        t = self.theme
+        ink = _rgba(t.colors["ink"])
+        gold = t.colors["gold"]
+        cream = t.colors["bg_cream"]
+        pad = self.w * 0.035
+        meter_w = self.w * 0.09
+        cam_w = (x1 - x0) - pad - meter_w
+        cam_h = y1 - y0
+        cam_x0, cam_y0 = x0, y0
+
+        panel_bg = (34, 48, 31)
+        draw.rectangle([cam_x0, cam_y0, cam_x0 + cam_w, cam_y0 + cam_h], fill=_rgba(panel_bg))
+        if camera_frame_bgr is not None:
+            fitted = _fit_cover_bgr(camera_frame_bgr, int(cam_w), int(cam_h))
+            fitted = cv2.flip(fitted, 1)
+            frame_img = Image.fromarray(cv2.cvtColor(fitted, cv2.COLOR_BGR2RGB)).convert("RGBA")
+            canvas.alpha_composite(frame_img, (int(cam_x0), int(cam_y0)))
+        else:
+            cam_note_font = self._font("heading_medium", int(self.h * 0.03))
+            draw.text((cam_x0 + cam_w / 2, cam_y0 + cam_h / 2), placeholder_text.upper(), font=cam_note_font, fill=_rgba((245, 239, 227)), anchor="mm")
+
+        draw.rectangle([cam_x0, cam_y0, cam_x0 + cam_w, cam_y0 + cam_h], outline=self._blend_full(panel_bg, gold, 150), width=1)
+        bracket = self.h * 0.03
+        for bx, by, dx, dy in (
+            (cam_x0 + 8, cam_y0 + 8, 1, 1), (cam_x0 + cam_w - 8, cam_y0 + 8, -1, 1),
+            (cam_x0 + 8, cam_y0 + cam_h - 8, 1, -1), (cam_x0 + cam_w - 8, cam_y0 + cam_h - 8, -1, -1),
+        ):
+            draw.line([(bx, by), (bx + bracket * dx, by)], fill=_rgba(gold), width=2)
+            draw.line([(bx, by), (bx, by + bracket * dy)], fill=_rgba(gold), width=2)
+
+        meter_x0 = cam_x0 + cam_w + pad
+        draw.rounded_rectangle(
+            [meter_x0, y0, meter_x0 + meter_w, y0 + cam_h], radius=4,
+            outline=_rgba(gold), fill=_rgba(cream),
+        )
+        mic_label_font = self._font("heading", int(self.h * 0.028))
+        mic_label_color = _rgba(t.colors["recording_red"]) if mic_clipped else ink
+        draw.text((meter_x0 + meter_w / 2, y0 + self.h * 0.03), t.text["mic_label"].upper(), font=mic_label_font, fill=mic_label_color, anchor="ma")
+        self._mic_meter(
+            canvas, meter_x0 + meter_w * 0.18, y0 + self.h * 0.075,
+            meter_w * 0.64, cam_h - self.h * 0.16, mic_fraction,
+        )
+        sub_font = self._font("heading_medium", int(self.h * 0.024))
+        sub_color = self._blend_full(cream, t.colors["ink"], 180)
+        draw.text((meter_x0 + meter_w / 2, y0 + cam_h - self.h * 0.03), t.text["mic_sublabel"].upper(), font=sub_font, fill=sub_color, anchor="ma")
+
+        return cam_x0, cam_y0, cam_w, cam_h
+
     # ── icons (Get Ready tips row) ───────────────────────────────────
     def _icon_camera(self, draw: ImageDraw.ImageDraw, cx: float, cy: float, s: float, color) -> None:
         w, h = s * 1.15, s * 0.72
@@ -325,6 +399,84 @@ class Renderer:
             canvas.paste(self._couple_photo, (int(photo_x), int(photo_y)))
 
         self._footer_bar(canvas, t.text["ready_footer"], now=now, pulse_hearts=True)
+        return self._to_bgr(canvas)
+
+    def render_preview(
+        self,
+        now: float,
+        camera_frame_bgr: np.ndarray | None,
+        mic_fraction: float,
+        mic_clipped: bool,
+    ) -> np.ndarray:
+        """Live camera + mic meter, guest checks themselves and taps Record.
+
+        Sets self.record_button_rect to the button's current pixel rect
+        every call so main.py's mouse/touch handler can hit-test against it
+        (see state_machine.py's module docstring for why this screen
+        exists). The camera here is genuinely live -- ffmpeg hasn't opened
+        the device yet at this point in the flow -- unlike RECORDING, which
+        only ever shows the last frame captured here.
+        """
+        t = self.theme
+        canvas = self._canvas(dimmed=True)
+        draw = ImageDraw.Draw(canvas)
+        ink = _rgba(t.colors["ink"])
+        gold_rgb = t.colors["gold"]
+        gold = _rgba(gold_rgb)
+        cream = t.colors["bg_cream"]
+        cx = self.w / 2
+
+        pad = self.w * 0.035
+        footer_h = max(48, int(self.h * 0.135))
+        button_h = self.h * 0.115
+        button_gap = self.h * 0.025
+
+        y = pad
+        header_font = self._font("heading_medium", int(self.h * 0.026))
+        names_u, date_u = t.couple_names.upper(), t.event_date.upper()
+        names_w = self._tracked_width(draw, names_u, header_font, 3)
+        date_w = self._tracked_width(draw, date_u, header_font, 3)
+        diamond_gap = self.w * 0.028
+        total_header_w = names_w + diamond_gap * 2 + date_w
+        start_x = cx - total_header_w / 2
+        end_x = self._draw_tracked_left(draw, start_x, y, names_u, header_font, gold, spacing=3)
+        self._draw_diamond(draw, end_x + diamond_gap / 2, y, 3, fill=gold)
+        self._draw_tracked_left(draw, end_x + diamond_gap, y, date_u, header_font, gold, spacing=3)
+        y += self.h * 0.05
+
+        script_font = self._font("script", int(self.h * 0.11))
+        draw.text((cx, y), t.text["get_ready_title"], font=script_font, fill=ink, anchor="ma")
+        y += self.h * 0.115
+
+        caption_font = self._font("heading_medium", int(self.h * 0.028))
+        self._draw_tracked(draw, cx, y, t.text["preview_caption"].upper(), caption_font, ink, spacing=2)
+        y += self.h * 0.05
+
+        content_y0 = y
+        content_y1 = self.h - footer_h - pad - button_h - button_gap
+        self._camera_and_meter_row(
+            canvas, draw, pad, content_y0, self.w - pad, content_y1,
+            camera_frame_bgr, mic_fraction, mic_clipped, t.text["cam_placeholder"],
+        )
+
+        btn_w = self.w * 0.4
+        btn_x0, btn_x1 = cx - btn_w / 2, cx + btn_w / 2
+        btn_y0 = content_y1 + button_gap
+        btn_y1 = btn_y0 + button_h
+        glow = self._pulse(now, period=1.6, lo=0.82, hi=1.0)
+        btn_fill = self._blend_full(cream, gold_rgb, int(255 * glow))
+        draw.rounded_rectangle(
+            [btn_x0, btn_y0, btn_x1, btn_y1], radius=int(button_h * 0.3),
+            fill=btn_fill, outline=_rgba(t.colors["gold_dark"]), width=2,
+        )
+        btn_font = self._font("heading", int(self.h * 0.038))
+        self._draw_tracked(
+            draw, cx, (btn_y0 + btn_y1) / 2, t.text["preview_button"].upper(), btn_font,
+            _rgba(t.colors["dark_bar"]), spacing=2,
+        )
+        self.record_button_rect = (int(btn_x0), int(btn_y0), int(btn_x1), int(btn_y1))
+
+        self._footer_bar(canvas, t.text["preview_footer"])
         return self._to_bgr(canvas)
 
     def render_countdown(
@@ -467,7 +619,6 @@ class Renderer:
         canvas = self._canvas(dimmed=True)
         draw = ImageDraw.Draw(canvas)
         ink = _rgba(t.colors["ink"])
-        gold = t.colors["gold"]
 
         pad = self.w * 0.035
         top_h = self.h * 0.16
@@ -509,46 +660,23 @@ class Renderer:
         draw.text((elapsed_x, dot_cy - self.h * 0.035), "ELAPSED", font=timer_label_font, fill=timer_label_color, anchor="ra")
         draw.text((elapsed_x, dot_cy + self.h * 0.005), _fmt(elapsed), font=timer_val_font, fill=ink, anchor="ra")
 
-        meter_w = self.w * 0.09
-        cam_w = (self.w - pad * 3 - meter_w)
-        cam_h = content_y1 - content_y0
-        cam_x0, cam_y0 = pad, content_y0
-
-        panel_bg = (34, 48, 31)
-        draw.rectangle([cam_x0, cam_y0, cam_x0 + cam_w, cam_y0 + cam_h], fill=_rgba(panel_bg))
-        if camera_frame_bgr is not None:
-            fitted = _fit_cover_bgr(camera_frame_bgr, int(cam_w), int(cam_h))
-            fitted = cv2.flip(fitted, 1)
-            frame_img = Image.fromarray(cv2.cvtColor(fitted, cv2.COLOR_BGR2RGB)).convert("RGBA")
-            canvas.alpha_composite(frame_img, (int(cam_x0), int(cam_y0)))
-        else:
-            cam_note_font = self._font("heading_medium", int(self.h * 0.03))
-            draw.text((cam_x0 + cam_w / 2, cam_y0 + cam_h / 2), t.text["cam_placeholder"].upper(), font=cam_note_font, fill=_rgba((245, 239, 227)), anchor="mm")
-
-        draw.rectangle([cam_x0, cam_y0, cam_x0 + cam_w, cam_y0 + cam_h], outline=self._blend_full(panel_bg, gold, 150), width=1)
-        bracket = self.h * 0.03
-        for bx, by, dx, dy in (
-            (cam_x0 + 8, cam_y0 + 8, 1, 1), (cam_x0 + cam_w - 8, cam_y0 + 8, -1, 1),
-            (cam_x0 + 8, cam_y0 + cam_h - 8, 1, -1), (cam_x0 + cam_w - 8, cam_y0 + cam_h - 8, -1, -1),
-        ):
-            draw.line([(bx, by), (bx + bracket * dx, by)], fill=_rgba(gold), width=2)
-            draw.line([(bx, by), (bx, by + bracket * dy)], fill=_rgba(gold), width=2)
-
-        meter_x0 = cam_x0 + cam_w + pad
-        draw.rounded_rectangle(
-            [meter_x0, content_y0, meter_x0 + meter_w, content_y0 + cam_h], radius=4,
-            outline=_rgba(gold), fill=_rgba(cream),
+        cam_x0, cam_y0, cam_w, cam_h = self._camera_and_meter_row(
+            canvas, draw, pad, content_y0, self.w - pad, content_y1,
+            camera_frame_bgr, mic_fraction, mic_clipped, t.text["cam_placeholder"],
         )
-        mic_label_font = self._font("heading", int(self.h * 0.028))
-        mic_label_color = _rgba(t.colors["recording_red"]) if mic_clipped else ink
-        draw.text((meter_x0 + meter_w / 2, content_y0 + self.h * 0.03), t.text["mic_label"].upper(), font=mic_label_font, fill=mic_label_color, anchor="ma")
-        self._mic_meter(
-            canvas, meter_x0 + meter_w * 0.18, content_y0 + self.h * 0.075,
-            meter_w * 0.64, cam_h - self.h * 0.16, mic_fraction,
+
+        # The camera feed here is always the frozen frame from the PREVIEW
+        # screen, not live (ffmpeg owns the camera during RECORDING -- see
+        # main.py's module docstring), so remind the guest where to look and
+        # how to finish, directly on the panel where their eyes already are.
+        strip_h = self.h * 0.045
+        strip = Image.new("RGBA", (int(cam_w), int(strip_h)), (34, 48, 31, 175))
+        canvas.alpha_composite(strip, (int(cam_x0), int(cam_y0 + cam_h - strip_h)))
+        look_font = self._font("heading_medium", int(self.h * 0.024))
+        draw.text(
+            (cam_x0 + cam_w / 2, cam_y0 + cam_h - strip_h / 2), t.text["recording_look_here"].upper(),
+            font=look_font, fill=_rgba((245, 239, 227)), anchor="mm",
         )
-        sub_font = self._font("heading_medium", int(self.h * 0.024))
-        sub_color = self._blend_full(cream, t.colors["ink"], 180)
-        draw.text((meter_x0 + meter_w / 2, content_y0 + cam_h - self.h * 0.03), t.text["mic_sublabel"].upper(), font=sub_font, fill=sub_color, anchor="ma")
 
         self._footer_bar(canvas, t.text["recording_footer"], now=now, pulse_hearts=True)
         return self._to_bgr(canvas)

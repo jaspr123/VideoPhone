@@ -1,5 +1,75 @@
 # Changelog
 
+## Unreleased — New PREVIEW screen: live camera before recording, not during
+
+User's idea after three rounds of RECORDING-time live-preview trouble: "what
+if we convert the get ready page as a preview page like the record page but
+with a live preview so someone can ready then have a record button push to
+start. then count down then switch to record page with screenshot of last
+frame, and look here and hang up when your done." This is a genuine
+architecture fix, not a workaround -- it removes the root cause of the
+audio-breakup/performance problems chased in the three preceding entries
+below, instead of further mitigating them.
+
+- **New `PREVIEW` state** (`state_machine.py`), between `READY` and
+  `COUNTDOWN`: `READY -> PREVIEW -> COUNTDOWN -> RECORDING -> ...`. The
+  guest lifts the receiver into `PREVIEW`, not straight into `COUNTDOWN` as
+  before.
+- **Why this is safe where the old approach wasn't:** ffmpeg hasn't opened
+  the camera yet during `PREVIEW` (or `COUNTDOWN`) -- `main.py`'s
+  `self.capture` (the same OpenCV preview object every pre-recording screen
+  already reads from) is still open, exactly as it always has been on
+  `COUNTDOWN`. So `PREVIEW` shows a genuinely live feed with **zero** new
+  processes, zero extra ffmpeg outputs, zero risk to the recording's audio
+  pipeline. `RECORDING` goes back to showing exactly what it always showed
+  before the removed feature existed: the last frame captured before ffmpeg
+  took over, now with a "look here, hang up when you're done" caption over
+  it (new `recording_look_here` theme text key).
+- **Removed the RECORDING-time live video preview entirely**
+  (`live_preview_enabled` and everything under it): `media/ffmpeg.py`'s
+  second `-map 0:v:0` / `-update 1` JPEG output, `RecordingSession.
+  live_preview_path`, `Recorder`'s live-preview file handling, and
+  `main.py`'s `_read_live_preview_frame()`. This was the actual source of
+  every RECORDING-preview hardware complaint this project has had; moving
+  the live feed to before `RECORDING` starts removes the conflict instead
+  of continuing to chase it.
+- **Tap-to-record with a safety-net timer, not a hard requirement:**
+  `PREVIEW` shows a pulsing on-screen "Tap to Record" button
+  (`Renderer.render_preview()`, hit-tested in `main.py`'s new `_on_mouse()`
+  via `cv2.setMouseCallback`) but also auto-advances into `COUNTDOWN` after
+  `preview_seconds` (new config field, default `8`) if nobody taps -- a
+  missed or miscalibrated touchscreen tap on real hardware (not yet
+  verified) can never strand a guest. Spacebar is an equivalent trigger in
+  `PREVIEW`, same as it already was for every other guest action
+  (architecture rule 11).
+- **`main.py`:** `_start_countdown()` (hook-lift entry point) split into
+  `_start_preview()` (enters `PREVIEW`, starts the mic-check thread, plays
+  the pickup greeting, sets the `preview_seconds` deadline) and a new,
+  narrower `_start_countdown()` (entered by a tap/Spacebar/auto-advance
+  from `PREVIEW`; just starts the numeric countdown -- the mic check keeps
+  running uninterrupted from `_start_preview()`). `_cancel_countdown()`
+  generalized to `_cancel_to_ready()`, now handling a hang-up from either
+  `PREVIEW` or `COUNTDOWN`.
+- **`ui/renderer.py`:** extracted the bordered/mirrored camera panel + mic
+  meter column (previously inline in `render_recording()`) into a shared
+  `_camera_and_meter_row()`, now used by both `render_recording()` and the
+  new `render_preview()`.
+- **Config:** new `preview_seconds: int` (default `8`), `live_preview_enabled`
+  removed. `live_mic_meter_enabled` (RECORDING's mic meter, unrelated to the
+  removed video preview) is unchanged.
+- **Theme:** new required `text` keys `preview_caption`, `preview_button`,
+  `preview_footer`, `recording_look_here`; `themes/classic-walnut/theme.json`
+  updated. Existing themes must add these four keys or `Theme.load()` will
+  reject them at startup, same as any other missing required text key.
+- All corresponding tests added/updated across `test_state_machine.py`,
+  `test_config.py`, `test_ffmpeg.py`, `test_recorder.py`, `test_renderer.py`,
+  and `test_main.py` (new coverage for `_start_preview`/`_start_countdown`/
+  `_cancel_to_ready`, the `preview_seconds` auto-advance in `tick()`, and
+  `_on_mouse()`'s button hit-testing). Full suite: 282 passed.
+- **Not yet confirmed on real hardware**, in particular the touchscreen tap
+  coordinates against `Renderer.record_button_rect` -- `preview_seconds` is
+  the deliberate safety net for exactly that uncertainty.
+
 ## Unreleased — Split RECORDING mic meter into its own toggle, switch it to arecord
 
 Direct hardware feedback: "the mic level isn't fluid... the mic is more

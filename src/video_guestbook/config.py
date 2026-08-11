@@ -100,16 +100,6 @@ class BoothConfig:
     # are the same USB audio adapter these may look similar but are not
     # interchangeable. None (default) uses aplay's system default device.
     audio_playback_device: str | None = None
-    # Live camera preview on the RECORDING screen: a low-fps, small JPEG
-    # written by the SAME recording ffmpeg process as an extra output (no
-    # second process ever opens the camera -- see media/ffmpeg.py
-    # is_live_video_copied()'s docstring on why that matters). Off by
-    # default: a first real-hardware pass at this contributed to audio
-    # breakup. If enabling this ever causes audio breakup, disable it
-    # before touching anything else. Independent of live_mic_meter_enabled
-    # below -- these are two separate features that happen to both live on
-    # the RECORDING screen.
-    live_preview_enabled: bool = False
     # Live mic meter on the RECORDING screen: a second AudioLevelReader
     # (same `arecord`-based mechanism as the countdown-time check, see
     # media/audio_levels.py) started shortly after ffmpeg begins recording.
@@ -119,6 +109,14 @@ class BoothConfig:
     # and the meter falls back to the last countdown reading, same as when
     # this is off. See main.py's _start_recording_mic_meter().
     live_mic_meter_enabled: bool = False
+    # How long the PREVIEW screen (live camera, tap-to-record button) lingers
+    # before auto-advancing into COUNTDOWN on its own -- a guest who never
+    # taps the button (or whose tap the touchscreen missed) still isn't
+    # stuck there forever (architecture rule 17). See state_machine.py's
+    # module docstring for why PREVIEW exists. (RECORDING's own camera
+    # preview -- config live_preview_enabled -- was removed once PREVIEW
+    # took over showing a live feed; see CHANGELOG.md.)
+    preview_seconds: int = 8
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -237,15 +235,15 @@ class BoothConfig:
             if not audio_playback_device:
                 raise ConfigError("audio_playback_device must not be empty when set (use null to omit)")
 
-        live_preview_enabled = data.get("live_preview_enabled", False)
-        if not isinstance(live_preview_enabled, bool):
-            raise ConfigError(f"live_preview_enabled must be a boolean, got {live_preview_enabled!r}")
-
         live_mic_meter_enabled = data.get("live_mic_meter_enabled", False)
         if not isinstance(live_mic_meter_enabled, bool):
             raise ConfigError(
                 f"live_mic_meter_enabled must be a boolean, got {live_mic_meter_enabled!r}"
             )
+
+        preview_seconds = data.get("preview_seconds", 8)
+        if not isinstance(preview_seconds, int) or preview_seconds <= 0:
+            raise ConfigError(f"preview_seconds must be a positive integer, got {preview_seconds!r}")
 
         return cls(
             camera_device=camera_device,
@@ -268,8 +266,8 @@ class BoothConfig:
             recording_mode=recording_mode,
             theme_dir=(base_dir / theme_dir).resolve(),
             audio_playback_device=audio_playback_device,
-            live_preview_enabled=live_preview_enabled,
             live_mic_meter_enabled=live_mic_meter_enabled,
+            preview_seconds=preview_seconds,
         )
 
     @classmethod

@@ -39,13 +39,6 @@ class RecordingSession:
     # live_output_path unless needs_transcode is true.
     final_output_path: Path
     needs_transcode: bool
-    # Live camera preview on the RECORDING screen (config
-    # live_preview_enabled): path to a continuously-overwritten preview
-    # JPEG written by this same ffmpeg process. None when
-    # live_preview_enabled is False. (The RECORDING screen's mic meter is
-    # a separate feature -- see main.py's _start_recording_mic_meter() --
-    # not part of this session object.)
-    live_preview_path: Path | None
 
 
 def generate_session_id(now: datetime | None = None) -> str:
@@ -68,13 +61,6 @@ def build_raw_output_filename(session_id: str) -> str:
 
 def build_raw_output_path(output_dir: Path, session_id: str) -> Path:
     return output_dir / build_raw_output_filename(session_id)
-
-
-def build_live_preview_path(log_dir: Path) -> Path:
-    """Fixed path (not per-session): only one recording runs at a time, and
-    this is ephemeral live-feedback state, not guest content -- it belongs
-    alongside logs, not in output_dir with the actual recordings."""
-    return log_dir / "live_preview.jpg"
 
 
 class Recorder:
@@ -106,20 +92,7 @@ class Recorder:
             live_output_path = build_output_path(self._config.output_dir, session_id)
             final_output_path = live_output_path
 
-        live_preview_path: Path | None = None
-        if self._config.live_preview_enabled:
-            self._config.log_dir.mkdir(parents=True, exist_ok=True)
-            live_preview_path = build_live_preview_path(self._config.log_dir)
-            # Clear any stale file from a previous session so a read before
-            # the first fresh write can't show an old frame.
-            try:
-                live_preview_path.unlink(missing_ok=True)
-            except OSError:
-                self._logger.debug("could not remove stale live-preview file %s", live_preview_path)
-
-        command = build_record_command(
-            self._config, live_output_path, live_preview_path=live_preview_path,
-        )
+        command = build_record_command(self._config, live_output_path)
 
         self._logger.info("starting recording session %s: %s", session_id, " ".join(command))
         try:
@@ -140,7 +113,6 @@ class Recorder:
             final_output_path=final_output_path,
             needs_transcode=transcode_needed,
             started_at=datetime.now(timezone.utc),
-            live_preview_path=live_preview_path,
         )
         return self._session
 

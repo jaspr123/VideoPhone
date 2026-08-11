@@ -1,11 +1,9 @@
 import dataclasses
 import logging
-import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
-import numpy as np
 import pytest
 
 from video_guestbook import main as main_module
@@ -100,79 +98,29 @@ def test_play_pickup_greeting_passes_configured_playback_device(tmp_path, monkey
     assert calls[0][1]["device"] == "plughw:CARD=Device,DEV=0"
 
 
-def test_start_countdown_triggers_pickup_greeting(tmp_path, monkeypatch):
+def test_start_preview_triggers_pickup_greeting(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(main_module, "play_sound_async", lambda *a, **k: calls.append((a, k)))
     theme = dataclasses.replace(Theme.load(THEME_DIR), sounds={"pickup": tmp_path / "pickup.wav"})
     app = _app(tmp_path, theme=theme)
 
-    app._start_countdown()
+    app._start_preview()
     app._stop_mic_check()
 
     assert len(calls) == 1
 
 
-def test_read_live_preview_frame_none_when_no_path(tmp_path):
-    app = _app(tmp_path)
-    assert app._read_live_preview_frame() is None
-
-
-def test_read_live_preview_frame_none_when_file_missing(tmp_path):
-    app = _app(tmp_path)
-    app._live_preview_path = tmp_path / "missing.jpg"
-    assert app._read_live_preview_frame() is None
-
-
-def test_read_live_preview_frame_decodes_real_jpeg(tmp_path):
-    app = _app(tmp_path)
-    path = tmp_path / "preview.jpg"
-    cv2.imwrite(str(path), np.zeros((10, 10, 3), dtype=np.uint8))
-    app._live_preview_path = path
-
-    result = app._read_live_preview_frame()
-
-    assert result is not None
-    assert result.shape == (10, 10, 3)
-
-
-def test_read_live_preview_frame_skips_redecode_when_mtime_unchanged(tmp_path, monkeypatch):
-    app = _app(tmp_path)
-    path = tmp_path / "preview.jpg"
-    cv2.imwrite(str(path), np.zeros((10, 10, 3), dtype=np.uint8))
-    app._live_preview_path = path
-
+def test_start_countdown_does_not_replay_pickup_greeting(tmp_path, monkeypatch):
     calls = []
-    real_imread = main_module.cv2.imread
+    monkeypatch.setattr(main_module, "play_sound_async", lambda *a, **k: calls.append((a, k)))
+    theme = dataclasses.replace(Theme.load(THEME_DIR), sounds={"pickup": tmp_path / "pickup.wav"})
+    app = _app(tmp_path, theme=theme)
+    app.state_machine.transition(BoothState.PREVIEW)
 
-    def counting_imread(p):
-        calls.append(p)
-        return real_imread(p)
+    app._start_countdown()
+    app._stop_mic_check()
 
-    monkeypatch.setattr(main_module.cv2, "imread", counting_imread)
-
-    app._read_live_preview_frame()
-    app._read_live_preview_frame()
-
-    assert len(calls) == 1
-
-
-def test_read_live_preview_frame_falls_back_on_corrupt_read(tmp_path):
-    app = _app(tmp_path)
-    path = tmp_path / "preview.jpg"
-    cv2.imwrite(str(path), np.zeros((10, 10, 3), dtype=np.uint8))
-    app._live_preview_path = path
-
-    first = app._read_live_preview_frame()
-    assert first is not None
-
-    path.write_bytes(b"not a real jpeg")
-    new_mtime = path.stat().st_mtime + 5
-    os.utime(path, (new_mtime, new_mtime))
-
-    second = app._read_live_preview_frame()
-
-    assert second is not None
-    np.testing.assert_array_equal(second, first)
+    assert calls == []
 
 
 def _fake_session(tmp_path, **overrides) -> RecordingSession:
@@ -182,22 +130,9 @@ def _fake_session(tmp_path, **overrides) -> RecordingSession:
         live_output_path=tmp_path / "out.mp4",
         final_output_path=tmp_path / "out.mp4",
         needs_transcode=False,
-        live_preview_path=None,
     )
     data.update(overrides)
     return RecordingSession(**data)
-
-
-def test_start_recording_sets_live_preview_path_from_session(tmp_path, monkeypatch):
-    app = _app(tmp_path)
-    fake_session = _fake_session(tmp_path, live_preview_path=tmp_path / "preview.jpg")
-    monkeypatch.setattr(app.recorder, "start", lambda: fake_session)
-    monkeypatch.setattr(main_module.time, "sleep", lambda seconds: None)
-    app.state_machine.transition(BoothState.COUNTDOWN)
-
-    app._start_recording()
-
-    assert app._live_preview_path == fake_session.live_preview_path
 
 
 def test_start_recording_mic_meter_noop_when_disabled(tmp_path):
@@ -247,6 +182,7 @@ def test_stop_and_save_stops_recording_mic_meter(tmp_path, monkeypatch):
         "R", (), {"ok": True, "duration_seconds": 1.0, "size_bytes": 1, "reason": ""}
     )())
     monkeypatch.setattr(app, "_reopen_camera_with_retry", lambda: True)
+    app.state_machine.transition(BoothState.PREVIEW)
     app.state_machine.transition(BoothState.COUNTDOWN)
     app.state_machine.transition(BoothState.RECORDING)
     app._start_recording_mic_meter()
@@ -255,3 +191,138 @@ def test_stop_and_save_stops_recording_mic_meter(tmp_path, monkeypatch):
     app._stop_and_save()
 
     assert app._mic_check_thread is None
+
+
+def test_start_preview_sets_state_and_deadline(tmp_path):
+    app = _app(tmp_path)
+    before = time.monotonic()
+
+    app._start_preview()
+    try:
+        assert app.state_machine.state == BoothState.PREVIEW
+        assert app._preview_deadline is not None
+        assert app._preview_deadline >= before + app.config.preview_seconds
+    finally:
+        app._stop_mic_check()
+
+
+def test_start_countdown_from_preview_clears_preview_deadline(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+
+    app._start_countdown()
+
+    assert app.state_machine.state == BoothState.COUNTDOWN
+    assert app._preview_deadline is None
+    assert app._countdown_deadline is not None
+
+
+def test_cancel_to_ready_from_preview_stops_mic_check(tmp_path):
+    app = _app(tmp_path)
+    app._start_preview()
+
+    app._cancel_to_ready()
+
+    assert app.state_machine.state == BoothState.READY
+    assert app._preview_deadline is None
+    assert app._mic_check_thread is None
+
+
+def test_cancel_to_ready_from_countdown_clears_countdown_deadline(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.state_machine.transition(BoothState.COUNTDOWN)
+    app._countdown_deadline = time.monotonic() + 100
+
+    app._cancel_to_ready()
+
+    assert app.state_machine.state == BoothState.READY
+    assert app._countdown_deadline is None
+
+
+def test_tick_auto_advances_preview_to_countdown_after_deadline(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app._preview_deadline = time.monotonic() - 0.01
+
+    app.tick()
+
+    assert app.state_machine.state == BoothState.COUNTDOWN
+
+
+def test_tick_does_not_advance_preview_before_deadline(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app._preview_deadline = time.monotonic() + 100
+
+    app.tick()
+
+    assert app.state_machine.state == BoothState.PREVIEW
+
+
+def test_handle_key_space_in_preview_starts_countdown(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+
+    app.handle_key(main_module.KEY_SPACE)
+
+    assert app.state_machine.state == BoothState.COUNTDOWN
+
+
+def test_on_mouse_tap_inside_button_rect_starts_countdown(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.renderer.record_button_rect = (10, 10, 100, 60)
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, 50, 30, 0, None)
+
+    assert app.state_machine.state == BoothState.COUNTDOWN
+
+
+def test_on_mouse_tap_outside_button_rect_does_nothing(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.renderer.record_button_rect = (10, 10, 100, 60)
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, 500, 500, 0, None)
+
+    assert app.state_machine.state == BoothState.PREVIEW
+
+
+def test_on_mouse_ignored_outside_preview_state(tmp_path):
+    app = _app(tmp_path)  # still READY
+    app.renderer.record_button_rect = (10, 10, 100, 60)
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, 50, 30, 0, None)
+
+    assert app.state_machine.state == BoothState.READY
+
+
+def test_on_mouse_noop_when_button_rect_not_set_yet(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    assert app.renderer.record_button_rect is None
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, 50, 30, 0, None)  # must not raise
+
+    assert app.state_machine.state == BoothState.PREVIEW
+
+
+def test_on_mouse_ignores_non_click_events(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.renderer.record_button_rect = (10, 10, 100, 60)
+
+    app._on_mouse(main_module.cv2.EVENT_MOUSEMOVE, 50, 30, 0, None)
+
+    assert app.state_machine.state == BoothState.PREVIEW
+
+
+def test_render_preview_state_uses_renderer_and_sets_button_rect(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+
+    frame = app.render(None)
+
+    assert frame is not None
+    assert app.renderer.record_button_rect is not None
