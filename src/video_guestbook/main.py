@@ -32,6 +32,7 @@ from video_guestbook.media.audio_levels import (
     LevelReading,
     MicrophoneError,
     classify_level,
+    read_latest_live_level,
 )
 from video_guestbook.media.audio_playback import play_sound_async
 from video_guestbook.media.mixer import MixerError, nudge_capture_gain
@@ -117,6 +118,16 @@ class BoothApp:
         self._mic_readings: list[LevelReading] = []
         self._latest_mic_reading: LevelReading | None = None
 
+        # Live RECORDING-screen feedback (config live_preview_enabled) --
+        # set from RecordingSession when a recording starts, read each
+        # render tick during RECORDING. See _read_live_preview_frame() and
+        # _read_live_level_reading().
+        self._live_preview_path: Path | None = None
+        self._live_preview_last_mtime: float | None = None
+        self._live_preview_last_frame = None
+        self._live_level_path: Path | None = None
+        self._live_level_last_reading: LevelReading | None = None
+
         self.hook_switch: HookSwitch | None = None
         self._hook_switch_was_lifted = False
 
@@ -146,7 +157,7 @@ class BoothApp:
             return
 
         try:
-            lifted = self.hook_switch.is_lifted
+            lifted = self.hook_switch.poll(time.monotonic())
         except HookSwitchError as exc:
             self.logger.warning("hook switch read failed, disabling: %s", exc)
             self.hook_switch = None
@@ -355,6 +366,11 @@ class BoothApp:
             session.live_output_path,
             " (raw, will transcode after)" if session.needs_transcode else "",
         )
+        self._live_preview_path = session.live_preview_path
+        self._live_preview_last_mtime = None
+        self._live_preview_last_frame = None
+        self._live_level_path = session.live_level_path
+        self._live_level_last_reading = None
         self._enter_state(BoothState.RECORDING)
 
     def _stop_and_save(self) -> None:
@@ -461,16 +477,19 @@ class BoothApp:
         elif state == BoothState.RECORDING:
             elapsed = now - self._state_entered_at
             remaining = max(0, self.config.max_recording_seconds - int(elapsed))
-            # No live mic tap during recording (ffmpeg owns the audio device
-            # exclusively, same one-process-at-a-time rule as the camera);
-            # this shows the last reading from the countdown-time check.
+            # Live feedback when config.live_preview_enabled (the ffmpeg
+            # process recording also writes these -- see media/ffmpeg.py);
+            # falls back to the frozen pre-recording frame / last countdown
+            # reading when unavailable (disabled, or not written yet).
+            live_frame = self._read_live_preview_frame()
+            live_level = self._read_live_level_reading() or latest_mic_reading
             return self.renderer.render_recording(
                 now,
-                frame,
+                live_frame if live_frame is not None else frame,
                 int(elapsed),
                 remaining,
-                _mic_fraction(latest_mic_reading),
-                bool(latest_mic_reading and latest_mic_reading.clipped),
+                _mic_fraction(live_level),
+                bool(live_level and live_level.clipped),
             )
         elif state == BoothState.SAVING:
             return self.renderer.render_saving(now)
@@ -480,6 +499,43 @@ class BoothApp:
             return self.renderer.render_error(now, self._last_result_reason)
 
         return self.renderer.render_ready(now)
+
+    def _read_live_preview_frame(self):
+        """Latest live preview frame during RECORDING, or None if unavailable.
+
+        Reads the JPEG ffmpeg keeps overwriting (config live_preview_enabled;
+        see media/ffmpeg.py). Skips re-decoding when the file's mtime hasn't
+        changed since the last read, and falls back to the last
+        successfully-decoded frame on a transient read-mid-write failure --
+        never raises, never blocks waiting for a fresh frame.
+        """
+        path = self._live_preview_path
+        if path is None:
+            return None
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return self._live_preview_last_frame
+        if mtime == self._live_preview_last_mtime:
+            return self._live_preview_last_frame
+
+        frame = cv2.imread(str(path))
+        if frame is None:
+            return self._live_preview_last_frame
+        self._live_preview_last_mtime = mtime
+        self._live_preview_last_frame = frame
+        return frame
+
+    def _read_live_level_reading(self) -> LevelReading | None:
+        """Latest live mic level during RECORDING, or the last known
+        reading if the file isn't there yet / momentarily unreadable."""
+        path = self._live_level_path
+        if path is None:
+            return None
+        reading = read_latest_live_level(path)
+        if reading is not None:
+            self._live_level_last_reading = reading
+        return self._live_level_last_reading
 
     def _read_frame(self):
         """Return the frame to display, honoring the camera/ffmpeg handoff."""

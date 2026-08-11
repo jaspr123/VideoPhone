@@ -100,6 +100,14 @@ class BoothConfig:
     # are the same USB audio adapter these may look similar but are not
     # interchangeable. None (default) uses aplay's system default device.
     audio_playback_device: str | None = None
+    # Live feedback on the RECORDING screen: a low-fps, small preview JPEG
+    # and a periodic mic-level readout, both produced by the SAME recording
+    # ffmpeg process as extra lightweight outputs/filter taps (no second
+    # process ever opens the camera or audio device -- see media/ffmpeg.py
+    # is_live_video_copied()'s docstring on why that matters). Adds a small
+    # amount of CPU work during recording; if audio breakup ever returns,
+    # try disabling this before anything else.
+    live_preview_enabled: bool = True
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -218,6 +226,10 @@ class BoothConfig:
             if not audio_playback_device:
                 raise ConfigError("audio_playback_device must not be empty when set (use null to omit)")
 
+        live_preview_enabled = data.get("live_preview_enabled", True)
+        if not isinstance(live_preview_enabled, bool):
+            raise ConfigError(f"live_preview_enabled must be a boolean, got {live_preview_enabled!r}")
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -239,6 +251,7 @@ class BoothConfig:
             recording_mode=recording_mode,
             theme_dir=(base_dir / theme_dir).resolve(),
             audio_playback_device=audio_playback_device,
+            live_preview_enabled=live_preview_enabled,
         )
 
     @classmethod

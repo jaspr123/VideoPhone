@@ -13,12 +13,14 @@ Level targets are from PROJECT_SPEC.md section 6:
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
 from array import array
 from dataclasses import dataclass
 from math import log10
+from pathlib import Path
 
 QUIET_RMS_DBFS = -40.0  # below this, RMS -> guest is too quiet / too far away
 LOUD_PEAK_DBFS = -6.0  # spec: "Peaks: below approximately -6 dBFS"
@@ -80,6 +82,49 @@ def classify_level(rms_dbfs: float, peak_dbfs: float) -> str:
     if peak_dbfs > LOUD_PEAK_DBFS:
         return STATUS_TOO_LOUD
     return STATUS_READY
+
+
+# Matches ffmpeg's `ametadata=print` output for astats channel 1 (see
+# media/ffmpeg.py's live_level_path support): lines like
+# "lavfi.astats.1.Peak_level=-18.063496" or "...=-inf" for total silence.
+# Channel 1 is used regardless of audio_channels -- a mono/left-channel
+# proxy is plenty for a live UI meter, no need for full multi-channel
+# handling here.
+_LIVE_LEVEL_RE = re.compile(r"lavfi\.astats\.1\.(Peak|RMS)_level=(-?(?:\d+\.\d+|inf))")
+
+
+def read_latest_live_level(path: Path) -> LevelReading | None:
+    """Parse the most recent complete Peak+RMS pair from a live-level file.
+
+    Returns None if the file doesn't exist yet or doesn't yet contain a
+    complete pair (e.g. read mid-write, or before the first chunk has been
+    flushed) -- callers should keep showing their last known reading in
+    that case, the same graceful-degradation approach used everywhere else
+    live hardware feedback can be momentarily unavailable.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+    values: dict[str, float] = {}
+    for key, raw_value in reversed(_LIVE_LEVEL_RE.findall(text)):
+        if key not in values:
+            values[key] = float(raw_value)
+        if len(values) == 2:
+            break
+    if len(values) < 2:
+        return None
+
+    peak_dbfs = values["Peak"]
+    rms_dbfs = values["RMS"]
+    return LevelReading(
+        timestamp=time.time(),
+        rms_dbfs=rms_dbfs,
+        peak_dbfs=peak_dbfs,
+        clipped=peak_dbfs >= CLIP_PEAK_DBFS,
+        status=classify_level(rms_dbfs, peak_dbfs),
+    )
 
 
 class AudioLevelReader:

@@ -17,5 +17,6 @@
   "hook_switch_enabled": true,
   "hook_switch_gpio_pin": 17,
   "recording_mode": "quality",
-  "theme_dir": "themes/classic-walnut"
+  "theme_dir": "themes/classic-walnut",
+  "live_preview_enabled": true
 }

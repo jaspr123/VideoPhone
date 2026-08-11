@@ -119,3 +119,56 @@ def test_close_is_resilient_to_button_close_errors(monkeypatch):
     monkeypatch.setattr(hook_switch_module, "Button", RaisingCloseButton)
     switch = HookSwitch(pin=17, diagnostic_pin=27)
     switch.close()  # must not raise
+
+
+def test_poll_first_call_reflects_current_state_with_no_delay(button_registry):
+    switch = HookSwitch(pin=17, diagnostic_pin=None)
+    button_registry[17].is_pressed = True
+    assert switch.poll(now=0.0) is True
+
+
+def test_poll_ignores_a_brief_bounce_back_to_the_original_state(button_registry):
+    switch = HookSwitch(pin=17, diagnostic_pin=None, poll_debounce_seconds=0.2)
+    button_registry[17].is_pressed = False
+    assert switch.poll(now=0.0) is False
+
+    # bounces to "lifted" briefly, then settles back to "not lifted" before
+    # the debounce window elapses -- must never be reported as a real change
+    button_registry[17].is_pressed = True
+    assert switch.poll(now=0.05) is False
+    button_registry[17].is_pressed = False
+    assert switch.poll(now=0.09) is False
+    assert switch.poll(now=0.5) is False
+
+
+def test_poll_confirms_change_only_after_debounce_window_elapses(button_registry):
+    switch = HookSwitch(pin=17, diagnostic_pin=None, poll_debounce_seconds=0.2)
+    button_registry[17].is_pressed = False
+    assert switch.poll(now=0.0) is False
+
+    button_registry[17].is_pressed = True
+    assert switch.poll(now=0.05) is False  # pending, not yet confirmed
+    assert switch.poll(now=0.10) is False  # still within the window
+    assert switch.poll(now=0.26) is True  # window elapsed -> confirmed
+
+
+def test_poll_debounce_window_restarts_if_raw_flickers_during_it(button_registry):
+    switch = HookSwitch(pin=17, diagnostic_pin=None, poll_debounce_seconds=0.2)
+    button_registry[17].is_pressed = False
+    assert switch.poll(now=0.0) is False
+
+    button_registry[17].is_pressed = True
+    assert switch.poll(now=0.05) is False  # pending "lifted" since t=0.05
+    button_registry[17].is_pressed = False
+    assert switch.poll(now=0.10) is False  # back to confirmed state, pending cleared
+    button_registry[17].is_pressed = True
+    assert switch.poll(now=0.15) is False  # new pending window starts at t=0.15
+    assert switch.poll(now=0.30) is False  # only 0.15s since the new pending start
+    assert switch.poll(now=0.36) is True  # 0.21s since t=0.15 -> confirmed
+
+
+def test_poll_wraps_read_errors(monkeypatch):
+    monkeypatch.setattr(hook_switch_module, "Button", RaisingReadButton)
+    switch = HookSwitch(pin=17, diagnostic_pin=None)
+    with pytest.raises(HookSwitchError, match="read failed"):
+        switch.poll(now=0.0)

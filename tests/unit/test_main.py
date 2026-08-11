@@ -1,13 +1,19 @@
 import dataclasses
 import logging
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from video_guestbook import main as main_module
 from video_guestbook.config import BoothConfig
 from video_guestbook.main import _METER_CEILING_DBFS, _METER_FLOOR_DBFS, BoothApp, _mic_fraction
 from video_guestbook.media.audio_levels import LevelReading
+from video_guestbook.media.recorder import RecordingSession
+from video_guestbook.state_machine import BoothState
 from video_guestbook.ui.theme import Theme
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -104,3 +110,119 @@ def test_start_countdown_triggers_pickup_greeting(tmp_path, monkeypatch):
     app._stop_mic_check()
 
     assert len(calls) == 1
+
+
+def test_read_live_preview_frame_none_when_no_path(tmp_path):
+    app = _app(tmp_path)
+    assert app._read_live_preview_frame() is None
+
+
+def test_read_live_preview_frame_none_when_file_missing(tmp_path):
+    app = _app(tmp_path)
+    app._live_preview_path = tmp_path / "missing.jpg"
+    assert app._read_live_preview_frame() is None
+
+
+def test_read_live_preview_frame_decodes_real_jpeg(tmp_path):
+    app = _app(tmp_path)
+    path = tmp_path / "preview.jpg"
+    cv2.imwrite(str(path), np.zeros((10, 10, 3), dtype=np.uint8))
+    app._live_preview_path = path
+
+    result = app._read_live_preview_frame()
+
+    assert result is not None
+    assert result.shape == (10, 10, 3)
+
+
+def test_read_live_preview_frame_skips_redecode_when_mtime_unchanged(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    path = tmp_path / "preview.jpg"
+    cv2.imwrite(str(path), np.zeros((10, 10, 3), dtype=np.uint8))
+    app._live_preview_path = path
+
+    calls = []
+    real_imread = main_module.cv2.imread
+
+    def counting_imread(p):
+        calls.append(p)
+        return real_imread(p)
+
+    monkeypatch.setattr(main_module.cv2, "imread", counting_imread)
+
+    app._read_live_preview_frame()
+    app._read_live_preview_frame()
+
+    assert len(calls) == 1
+
+
+def test_read_live_preview_frame_falls_back_on_corrupt_read(tmp_path):
+    app = _app(tmp_path)
+    path = tmp_path / "preview.jpg"
+    cv2.imwrite(str(path), np.zeros((10, 10, 3), dtype=np.uint8))
+    app._live_preview_path = path
+
+    first = app._read_live_preview_frame()
+    assert first is not None
+
+    path.write_bytes(b"not a real jpeg")
+    new_mtime = path.stat().st_mtime + 5
+    os.utime(path, (new_mtime, new_mtime))
+
+    second = app._read_live_preview_frame()
+
+    assert second is not None
+    np.testing.assert_array_equal(second, first)
+
+
+def test_read_live_level_reading_none_when_no_path(tmp_path):
+    app = _app(tmp_path)
+    assert app._read_live_level_reading() is None
+
+
+def test_read_live_level_reading_parses_file(tmp_path):
+    app = _app(tmp_path)
+    path = tmp_path / "levels.txt"
+    path.write_text("lavfi.astats.1.Peak_level=-10.0\nlavfi.astats.1.RMS_level=-20.0\n")
+    app._live_level_path = path
+
+    reading = app._read_live_level_reading()
+
+    assert reading is not None
+    assert reading.peak_dbfs == pytest.approx(-10.0)
+
+
+def test_read_live_level_reading_falls_back_to_last_known(tmp_path):
+    app = _app(tmp_path)
+    path = tmp_path / "levels.txt"
+    path.write_text("lavfi.astats.1.Peak_level=-10.0\nlavfi.astats.1.RMS_level=-20.0\n")
+    app._live_level_path = path
+    first = app._read_live_level_reading()
+    assert first is not None
+
+    path.write_text("")  # no complete pair yet -- must not report "no signal"
+
+    second = app._read_live_level_reading()
+
+    assert second is first
+
+
+def test_start_recording_sets_live_preview_and_level_paths_from_session(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    fake_session = RecordingSession(
+        session_id="20260101_000000_abcd1234",
+        started_at=datetime.now(timezone.utc),
+        live_output_path=tmp_path / "out.mp4",
+        final_output_path=tmp_path / "out.mp4",
+        needs_transcode=False,
+        live_preview_path=tmp_path / "preview.jpg",
+        live_level_path=tmp_path / "level.txt",
+    )
+    monkeypatch.setattr(app.recorder, "start", lambda: fake_session)
+    monkeypatch.setattr(main_module.time, "sleep", lambda seconds: None)
+    app.state_machine.transition(BoothState.COUNTDOWN)
+
+    app._start_recording()
+
+    assert app._live_preview_path == fake_session.live_preview_path
+    assert app._live_level_path == fake_session.live_level_path

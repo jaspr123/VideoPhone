@@ -1,5 +1,77 @@
 # Changelog
 
+## Unreleased — Genuinely live RECORDING preview/mic meter, hook switch debounce fix, welcome screen cleanup
+
+Second round of real-hardware feedback: a visual glitch on the welcome
+screen, a request to make the RECORDING screen's preview and mic meter
+actually live (previously documented as an intentionally-frozen
+limitation), and a hook switch that sometimes didn't register a lift or
+needed a second hang-up motion to register.
+
+- **Welcome screen:** removed the ambient "bokeh" effect (soft blurred
+  drifting circles) from the `READY` screen -- reported as looking like a
+  visual glitch on real hardware. It was the only animated effect unique
+  to that screen, so removed outright rather than trying to retune it
+  blind; `_draw_ambient_bokeh` and its `_soft_blur` helper are gone.
+
+- **Hook switch double-action bug (real root cause found, not guessed):**
+  `gpiozero`'s `Button(bounce_time=...)` only debounces its own
+  `when_pressed`/`when_released` callback system -- it does *not* debounce
+  plain `is_pressed` reads, which is all `HookSwitch.is_lifted` (and this
+  app's polling loop) ever does. A tight poll loop reading raw GPIO state
+  during a real mechanical switch's bounce window can see a transition
+  "eaten" by bounce-parity, exactly matching the reported symptom (lift
+  sometimes did nothing; hang-up sometimes needed a second motion).
+  `hardware/hook_switch.py` adds `HookSwitch.poll(now)`: a raw reading must
+  hold steady for `poll_debounce_seconds` (~200ms) before it's accepted as
+  a real state change. `main.py`'s edge detection now calls `poll()`
+  instead of the raw `is_lifted` property. 6 new tests simulate bounce
+  sequences with controlled timestamps (no real GPIO or real time needed).
+
+- **Live RECORDING preview + mic meter (previously a documented
+  limitation, now real):** the recording ffmpeg process now writes two
+  *extra*, lightweight outputs on top of the actual recording -- a
+  continuously-overwritten low-res JPEG (`fps=5,scale=480:-2`, `-update 1`
+  image2 muxer) and a periodic mic-level readout (an `astats`/`ametadata`
+  tap appended to the *existing* audio filter chain, not a second capture).
+  Neither adds a second process touching the camera or audio device, so
+  the one-process-at-a-time constraints this project already fought
+  through stay intact. New config `live_preview_enabled` (default `true`)
+  turns both off at once if this ever needs to be ruled out as a cause of
+  audio breakup.
+
+  This was validated directly against a real `ffmpeg` binary before being
+  wired into the app, not just unit-tested: dual-mapping the same input
+  stream into both a `-c:v copy` output and a filtered low-fps output,
+  combined with the proven `-thread_queue_size`/`-use_wallclock_as_
+  timestamps` sync flags, initially appeared to break the second output
+  ("No filtered frames for output stream") when tested against a
+  pre-muxed test file -- root-caused to the test file's own embedded
+  timestamps conflicting with forced wallclock timestamps, an artifact of
+  the test method, not the technique. Re-validated against raw MJPEG/H.264
+  *elementary streams* (no container timestamps, matching how `v4l2`/
+  `alsa` actually deliver live frames) in every combination this app can
+  produce (`quality`+MJPEG copy, `fast`+MJPEG live-encode, H.264 copy,
+  `av_sync_offset_ms` itsoffset) and confirmed working every time. Finally
+  re-verified against the actual `build_record_command()` output byte-for-
+  byte (only the device source flags substituted, since this sandbox has
+  no real camera), including the astats level-parsing.
+  - `media/ffmpeg.py`: `build_record_command()` gains optional
+    `live_preview_path`/`live_level_path` params; extends the *existing*
+    `-af` chain for the level tap rather than adding a third output.
+  - `media/audio_levels.py`: `read_latest_live_level()` parses ffmpeg's
+    `ametadata=print` output (channel-1 Peak/RMS pair), tolerant of a
+    read caught mid-write and of `-inf` (true silence).
+  - `media/recorder.py`: `RecordingSession` gains `live_preview_path`/
+    `live_level_path`; `Recorder.start()` clears stale files from the
+    previous session before ffmpeg writes fresh ones.
+  - `main.py`: `_read_live_preview_frame()`/`_read_live_level_reading()`
+    poll these each render tick during `RECORDING`, skip re-decoding an
+    unchanged file (by mtime), and fall back to the last good value on a
+    transient read-mid-write -- never block, never raise.
+  - 25 new tests across `test_ffmpeg.py`, `test_audio_levels.py`,
+    `test_recorder.py`, and `test_main.py`. 264 tests passing.
+
 ## Unreleased — Pickup greeting sound + custom tip icons
 
 Follow-up feedback after the themed-UI pass landed on real hardware: a

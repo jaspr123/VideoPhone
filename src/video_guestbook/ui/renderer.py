@@ -272,7 +272,6 @@ class Renderer:
     def render_ready(self, now: float) -> np.ndarray:
         t = self.theme
         canvas = self._canvas()
-        self._draw_ambient_bokeh(canvas, now)
         draw = ImageDraw.Draw(canvas)
         ink = _rgba(t.colors["ink"])
         gold = _rgba(t.colors["gold"])
@@ -327,28 +326,6 @@ class Renderer:
 
         self._footer_bar(canvas, t.text["ready_footer"], now=now, pulse_hearts=True)
         return self._to_bgr(canvas)
-
-    def _draw_ambient_bokeh(self, canvas: Image.Image, now: float) -> None:
-        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        gold = self.theme.colors["gold"]
-        cream = self.theme.colors["bg_cream"]
-        specs = [
-            (0.12, 0.22, 0.09, cream, 17.0, 0.0, 0.55),
-            (0.64, 0.12, 0.12, gold, 23.0, -6.0, 0.35),
-            (0.38, 0.58, 0.07, cream, 19.0, -11.0, 0.5),
-            (0.80, 0.66, 0.10, gold, 26.0, -3.0, 0.28),
-        ]
-        for fx, fy, fr, color, period, delay, max_alpha in specs:
-            phase = ((now + delay) % period) / period
-            wobble = math.sin(phase * 2 * math.pi)
-            cx = fx * self.w + wobble * self.w * 0.018
-            cy = fy * self.h - abs(wobble) * self.h * 0.03
-            radius = fr * min(self.w, self.h) * (1 + 0.1 * wobble)
-            alpha = int(max_alpha * 255 * (0.6 + 0.4 * (1 - abs(wobble))))
-            draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=_rgba(color, alpha))
-        overlay = overlay.filter(_soft_blur())
-        canvas.alpha_composite(overlay)
 
     def render_countdown(
         self,
@@ -706,12 +683,6 @@ class Renderer:
 
         self._footer_bar(canvas, t.text["error_footer"])
         return self._to_bgr(canvas)
-
-
-def _soft_blur():
-    from PIL import ImageFilter
-
-    return ImageFilter.GaussianBlur(radius=14)
 
 
 def _cover_resize(img: Image.Image, box_w: int, box_h: int) -> Image.Image:

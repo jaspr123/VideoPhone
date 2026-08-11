@@ -41,6 +41,22 @@ def find_ffprobe() -> str:
 _SOFTWARE_ENCODE_PRESET = "ultrafast"
 _SOFTWARE_ENCODE_BITRATE = "4M"
 
+# Live preview/level feedback for the RECORDING screen (config
+# live_preview_enabled): a low-fps, small JPEG snapshot and a periodic mic
+# level readout, both produced as *extra* outputs/filter taps on this same
+# ffmpeg process -- never a second process opening the camera or audio
+# device. Verified against real ffmpeg (dual `-map` of the same input
+# stream, one `-c:v copy` and one filtered, plus the existing thread_queue_
+# size/wallclock/itsoffset flags together) using a raw elementary-stream
+# source (matching how v4l2/alsa deliver frames -- no pre-existing
+# container timestamps to conflict with -use_wallclock_as_timestamps,
+# unlike a pre-muxed file). Deliberately small/low-fps to keep the added
+# CPU cost well below a second real-time encode.
+_LIVE_PREVIEW_WIDTH = 480
+_LIVE_PREVIEW_FPS = 5
+_LIVE_PREVIEW_JPEG_QUALITY = "6"  # ffmpeg -q:v scale: 2 (best) .. 31 (worst)
+_LIVE_LEVEL_CHUNK_SECONDS = 0.1  # matches the countdown-time mic check's cadence
+
 
 def is_live_video_copied(config: BoothConfig) -> bool:
     """True if the live recording command copies video with no re-encode.
@@ -64,7 +80,12 @@ def needs_deferred_transcode(config: BoothConfig) -> bool:
     return config.record_input_format == "mjpeg" and config.recording_mode == "quality"
 
 
-def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
+def build_record_command(
+    config: BoothConfig,
+    output_path: Path,
+    live_preview_path: Path | None = None,
+    live_level_path: Path | None = None,
+) -> list[str]:
     """Build the ffmpeg argv for recording camera + microphone.
 
     See is_live_video_copied() for when video is copied vs. software
@@ -88,6 +109,14 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
     (PROJECT_SPEC.md section 21, known risk #7) via ffmpeg's -itsoffset:
     positive values delay the video input, negative values delay the audio
     input. It has no effect when 0 (the default).
+
+    live_preview_path/live_level_path (both optional, config
+    live_preview_enabled): when given, this same process also writes a
+    continuously-overwritten low-fps preview JPEG and/or a periodic mic
+    level readout, so the RECORDING screen can show real live feedback
+    without a second process ever touching the camera or audio device. See
+    the module-level comment above _LIVE_PREVIEW_WIDTH for how this was
+    validated.
     """
     ffmpeg = find_ffmpeg()
     width, height = config.record_width_height
@@ -134,7 +163,15 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
             str(config.record_fps),
         ]
 
-    return (
+    audio_filters = "aresample=async=1:first_pts=0"
+    if live_level_path is not None:
+        chunk_samples = max(1, int(config.audio_sample_rate * _LIVE_LEVEL_CHUNK_SECONDS))
+        audio_filters += (
+            f",asetnsamples=n={chunk_samples},astats=metadata=1:reset=1"
+            f",ametadata=print:file={live_level_path}"
+        )
+
+    command = (
         [ffmpeg, "-y"]
         + video_input
         + audio_input
@@ -155,7 +192,7 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
             "-ac",
             str(config.audio_channels),
             "-af",
-            "aresample=async=1:first_pts=0",
+            audio_filters,
             "-avoid_negative_ts",
             "make_zero",
             "-t",
@@ -165,6 +202,21 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
             str(output_path),
         ]
     )
+
+    if live_preview_path is not None:
+        command += [
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"fps={_LIVE_PREVIEW_FPS},scale={_LIVE_PREVIEW_WIDTH}:-2",
+            "-update",
+            "1",
+            "-q:v",
+            _LIVE_PREVIEW_JPEG_QUALITY,
+            str(live_preview_path),
+        ]
+
+    return command
 
 
 def build_transcode_command(input_path: Path, output_path: Path, config: BoothConfig) -> list[str]:

@@ -207,6 +207,90 @@ def test_needs_deferred_transcode(tmp_path):
     )
 
 
+def test_no_live_preview_or_level_by_default(tmp_path):
+    config = make_config(tmp_path)
+    output_path = tmp_path / "recordings" / "session.mp4"
+
+    command = ffmpeg_module.build_record_command(config, output_path)
+
+    assert "-update" not in command
+    assert "ametadata" not in command[command.index("-af") + 1]
+
+
+def test_live_preview_path_adds_second_low_fps_output(tmp_path):
+    config = make_config(tmp_path)
+    output_path = tmp_path / "recordings" / "session.mp4"
+    preview_path = tmp_path / "logs" / "live_preview.jpg"
+
+    command = ffmpeg_module.build_record_command(config, output_path, live_preview_path=preview_path)
+
+    # Same source stream mapped a second time -- still two -map 0:v:0.
+    map_indices = [i for i, arg in enumerate(command) if arg == "-map"]
+    mapped_values = [command[i + 1] for i in map_indices]
+    assert mapped_values.count("0:v:0") == 2
+    assert mapped_values.count("1:a:0") == 1
+    assert "-update" in command
+    assert command[command.index("-update") + 1] == "1"
+    assert command[-1] == str(preview_path)
+    # Main output is untouched -- still -c:v copy for this h264 config.
+    assert command[command.index("-c:v") + 1] == "copy"
+
+
+def test_live_preview_scale_and_fps_are_conservative(tmp_path):
+    config = make_config(tmp_path)
+    output_path = tmp_path / "recordings" / "session.mp4"
+    preview_path = tmp_path / "logs" / "live_preview.jpg"
+
+    command = ffmpeg_module.build_record_command(config, output_path, live_preview_path=preview_path)
+
+    vf_value = command[command.index("-vf") + 1]
+    assert "fps=" in vf_value
+    assert "scale=" in vf_value
+
+
+def test_live_level_path_extends_audio_filter_chain(tmp_path):
+    config = make_config(tmp_path)
+    output_path = tmp_path / "recordings" / "session.mp4"
+    level_path = tmp_path / "logs" / "live_level.txt"
+
+    command = ffmpeg_module.build_record_command(config, output_path, live_level_path=level_path)
+
+    af_value = command[command.index("-af") + 1]
+    assert af_value.startswith("aresample=async=1:first_pts=0,")
+    assert "astats=metadata=1:reset=1" in af_value
+    assert f"ametadata=print:file={level_path}" in af_value
+    # A second -map 0:v:0 must NOT appear just because live_level_path was
+    # given -- that's the preview branch's job, independent of this one.
+    map_indices = [i for i, arg in enumerate(command) if arg == "-map"]
+    mapped_values = [command[i + 1] for i in map_indices]
+    assert mapped_values.count("0:v:0") == 1
+
+
+def test_live_level_chunk_size_scales_with_sample_rate(tmp_path):
+    config = make_config(tmp_path, audio_sample_rate=44100)
+    output_path = tmp_path / "recordings" / "session.mp4"
+    level_path = tmp_path / "logs" / "live_level.txt"
+
+    command = ffmpeg_module.build_record_command(config, output_path, live_level_path=level_path)
+
+    af_value = command[command.index("-af") + 1]
+    assert "asetnsamples=n=4410" in af_value  # 44100 * 0.1s
+
+
+def test_live_preview_and_level_can_both_be_set(tmp_path):
+    config = make_config(tmp_path)
+    output_path = tmp_path / "recordings" / "session.mp4"
+    preview_path = tmp_path / "logs" / "live_preview.jpg"
+    level_path = tmp_path / "logs" / "live_level.txt"
+
+    command = ffmpeg_module.build_record_command(
+        config, output_path, live_preview_path=preview_path, live_level_path=level_path
+    )
+
+    assert command[-1] == str(preview_path)
+    assert f"ametadata=print:file={level_path}" in command[command.index("-af") + 1]
+
+
 def test_build_transcode_command(tmp_path):
     config = make_config(tmp_path, record_input_format="mjpeg", recording_mode="quality")
     raw_path = tmp_path / "recordings" / "session.raw.mkv"

@@ -39,6 +39,12 @@ class RecordingSession:
     # live_output_path unless needs_transcode is true.
     final_output_path: Path
     needs_transcode: bool
+    # Live RECORDING-screen feedback (config live_preview_enabled): paths
+    # to a continuously-overwritten preview JPEG and a periodic mic-level
+    # readout, both written by this same ffmpeg process. None when
+    # live_preview_enabled is False.
+    live_preview_path: Path | None
+    live_level_path: Path | None
 
 
 def generate_session_id(now: datetime | None = None) -> str:
@@ -61,6 +67,17 @@ def build_raw_output_filename(session_id: str) -> str:
 
 def build_raw_output_path(output_dir: Path, session_id: str) -> Path:
     return output_dir / build_raw_output_filename(session_id)
+
+
+def build_live_preview_path(log_dir: Path) -> Path:
+    """Fixed path (not per-session): only one recording runs at a time, and
+    this is ephemeral live-feedback state, not guest content -- it belongs
+    alongside logs, not in output_dir with the actual recordings."""
+    return log_dir / "live_preview.jpg"
+
+
+def build_live_level_path(log_dir: Path) -> Path:
+    return log_dir / "live_level.txt"
 
 
 class Recorder:
@@ -91,7 +108,25 @@ class Recorder:
         else:
             live_output_path = build_output_path(self._config.output_dir, session_id)
             final_output_path = live_output_path
-        command = build_record_command(self._config, live_output_path)
+
+        live_preview_path: Path | None = None
+        live_level_path: Path | None = None
+        if self._config.live_preview_enabled:
+            self._config.log_dir.mkdir(parents=True, exist_ok=True)
+            live_preview_path = build_live_preview_path(self._config.log_dir)
+            live_level_path = build_live_level_path(self._config.log_dir)
+            # Clear any stale file from a previous session so a read before
+            # the first fresh write can't show old data.
+            for stale_path in (live_preview_path, live_level_path):
+                try:
+                    stale_path.unlink(missing_ok=True)
+                except OSError:
+                    self._logger.debug("could not remove stale live-feedback file %s", stale_path)
+
+        command = build_record_command(
+            self._config, live_output_path,
+            live_preview_path=live_preview_path, live_level_path=live_level_path,
+        )
 
         self._logger.info("starting recording session %s: %s", session_id, " ".join(command))
         try:
@@ -112,6 +147,8 @@ class Recorder:
             final_output_path=final_output_path,
             needs_transcode=transcode_needed,
             started_at=datetime.now(timezone.utc),
+            live_preview_path=live_preview_path,
+            live_level_path=live_level_path,
         )
         return self._session
 

@@ -185,6 +185,7 @@ Key fields:
 | `recording_mode`         | `quality` (default, deferred background transcode, no audio-dropout risk) or `fast` (live transcode, immediately final). Only matters when `record_input_format` is `mjpeg`. See "Recording modes" below. |
 | `theme_dir`              | Path to a theme directory (default `themes/classic-walnut`), relative to the repository root. See "Themed guest UI" below. |
 | `audio_playback_device`  | ALSA *playback* device for prompt sounds (e.g. the pickup greeting), e.g. `plughw:CARD=Device,DEV=0`. `null`/omitted uses the system default output. Separate from `audio_device` (the microphone). |
+| `live_preview_enabled`   | `true` (default) for a genuinely live camera preview + mic meter on the RECORDING screen. See "Live camera preview and mic meter during RECORDING" below; set `false` first if audio breakup/lag ever returns. |
 
 ## Camera compatibility (H.264 vs MJPEG)
 
@@ -347,32 +348,30 @@ Any subset works — an icon key you omit keeps the built-in drawing for that
 tip. Icons are scaled down to fit their slot while preserving aspect ratio
 (no cropping), so any reasonable square-ish PNG works.
 
-### Known limitations: RECORDING screen's live preview and mic meter
+### Live camera preview and mic meter during RECORDING
 
 Only the `RECORDING` screen shows the camera (in a bordered panel, mirrored,
 matching the design) — every other screen is fully synthetic branded art.
-The `RECORDING` screen's live preview **freezes at the last frame** captured
-before ffmpeg takes over the camera (see the camera/ffmpeg handoff note
-above) — this is the same pre-existing hardware constraint as the legacy
-prototype, not a regression, and it's expected to look static/non-live.
-Likewise, the `RECORDING` screen's mic meter is designed to **freeze at the
-last reading** from the countdown-time mic check rather than update live,
-since ffmpeg also holds the audio device exclusively while recording.
+Both the preview and the mic meter on that screen are genuinely **live**,
+not frozen: the recording ffmpeg process itself writes a continuously-
+updated low-res preview JPEG and a periodic mic-level readout as *extra*
+outputs on the same process (see `config live_preview_enabled`, default
+on) — no second process ever opens the camera or audio device, so this
+doesn't reintroduce the one-process-at-a-time conflicts this project
+already worked around elsewhere. See CHANGELOG.md for how this was
+validated against real ffmpeg before being wired in.
 
-If the mic meter looks completely empty/blank the *entire* time (not just
-static-but-lit), that's not this limitation — it means the countdown-time
-mic check itself never got a reading. Check `logs/booth.log` for lines
-starting with `countdown mic check` around the time you lifted the
-receiver; a `could not start` or `stopped early` warning there points at a
-real capture problem (wrong `audio_device`, `arecord` missing, device busy)
-worth chasing separately from the frozen-vs-live design limitation.
+This does add a small amount of extra CPU work during recording (decoding
+the video a second time for the small/low-fps preview branch, an audio
+filter tap for the level readout). If audio breakup or lag ever returns,
+set `"live_preview_enabled": false` in `config/booth.local.json` before
+changing anything else — that isolates whether this feature is the cause.
 
-A true live feed and live meter during actual recording would need ffmpeg
-to fan out a second low-res preview stream (video) and a way to tap the
-audio device without taking it from ffmpeg (audio) while it records — a
-real but separate follow-up (see CHANGELOG.md), not attempted here since it
-changes the same camera/audio exclusivity architecture that caused a real
-CPU-contention audio bug earlier this project, untested on real hardware.
+If the mic meter looks completely empty/blank the *entire* recording (not
+just quiet), check `logs/booth.log` around when you lifted the receiver —
+a `countdown mic check ... could not start` or `stopped early` warning
+there points at a real capture problem (wrong `audio_device`, `arecord`
+missing, device busy) separate from this feature.
 
 ## Fixing audio/video sync
 
@@ -506,9 +505,13 @@ identically at the same time -- it's a permanent backup, not just a dev
 tool.
 
 - **GPIO17** is the primary signal (stable LOW = lifted, stable HIGH =
-  on-hook, using the GPIO's internal pull-up). Debouncing (~150ms) is
-  handled by `gpiozero`'s `Button` class, so brief mechanical bounce during
-  the switch's travel is filtered out automatically.
+  on-hook, using the GPIO's internal pull-up). `gpiozero`'s `Button`
+  bounce_time only debounces its own callback events, not the plain
+  polling reads this app actually does -- confirmed on real hardware as a
+  lift or hang-up sometimes not registering, or needing a second motion to
+  register. `HookSwitch.poll()` adds its own time-based software debounce
+  (~200ms) on top for that reason; `main.py` always uses `poll()` for
+  start/stop, never the raw instantaneous reading.
 - **GPIO27** was observed to stay low regardless of hook state during
   initial testing and is read only for diagnostics (available via
   `HookSwitch.diagnostic_is_active` if you're debugging wiring), never used
