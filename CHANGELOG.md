@@ -1,5 +1,58 @@
 # Changelog
 
+## Unreleased — Fix live preview/mic meter perf bug, default it off
+
+Real-hardware feedback on the just-shipped live RECORDING preview/mic
+meter: the mic meter got choppier as a recording went on, and the preview
+was "breaking" the recording (audio issues). Found and fixed the actual
+bug rather than abandoning the feature, but defaulted it back off until
+the fix is confirmed on real hardware.
+
+- **Root cause:** the mic-level tap printed *all* ~20 `astats` metrics
+  every 100ms into a file with no bound on size for the whole recording,
+  and `main.py` re-read and re-parsed that *entire, ever-growing* file on
+  every render tick -- cost that climbed the longer a recording ran,
+  explaining both "not fluid" (gets worse over time) and the extra CPU
+  load contributing to audio breakup.
+- **Fix, not abandonment:**
+  - `media/ffmpeg.py`: `astats` now computes only the 2 metrics actually
+    used via `measure_perchannel=Peak_level+RMS_level:measure_overall=none`
+    (restricting what gets *computed and attached* in the first place,
+    not filtering at print time). Tried chaining two `ametadata=print`
+    filters writing the same file first (one per key) to get the same
+    effect -- that made ffmpeg hang, caught by testing against real ffmpeg
+    before shipping, same as every other change to this file this
+    session. Also shrank the preview JPEG (480px -> 320px) and slowed it
+    (5fps -> 2fps) to cut its cost further, directly per the "take load
+    off the rpi" ask.
+  - `media/audio_levels.py`: `read_latest_live_level()` now only reads the
+    last ~4KB of the level file (`_LIVE_LEVEL_TAIL_BYTES`), not the whole
+    thing -- cost stays flat regardless of how long the recording has
+    been running, instead of growing with it.
+  - Re-validated against real ffmpeg end-to-end with the actual
+    `build_record_command()` output (not a hand-typed approximation):
+    confirmed the level file stays small and the parser reads it
+    correctly straight from a real ffmpeg run.
+- **Default flipped to off** (`live_preview_enabled: false`): this feature
+  has now caused two rounds of real-hardware trouble in a row. The fix
+  above is validated against real ffmpeg the same rigorous way everything
+  in this file has been, but not yet confirmed on the actual Pi -- so it
+  stays opt-in rather than defaulting back on. Flip it on in
+  `config/booth.local.json`, test a real recording, and report back before
+  it becomes the default again.
+- **Answered: "the Get Ready screen's mic meter is fluid, can't we just
+  reuse that during RECORDING too?"** No, not directly -- that reader is a
+  live `arecord` process, and ffmpeg holds the ALSA capture device
+  exclusively while actually recording, the same one-process-at-a-time
+  constraint that governs the camera. A second `arecord` at the same time
+  would either fail outright or depend on ALSA `dsnoop`/`dmix` sharing
+  being configured on that specific hardware, not something to assume.
+  The `astats` tap already in use gets the same live-level result without
+  a second process, by reading the audio ffmpeg is already decoding for
+  the recording itself.
+- Updated existing tests for the new default and the narrowed `astats`
+  filter string; added a default-value test. 269 tests passing.
+
 ## Unreleased — Genuinely live RECORDING preview/mic meter, hook switch debounce fix, welcome screen cleanup
 
 Second round of real-hardware feedback: a visual glitch on the welcome

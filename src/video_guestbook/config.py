@@ -104,10 +104,15 @@ class BoothConfig:
     # and a periodic mic-level readout, both produced by the SAME recording
     # ffmpeg process as extra lightweight outputs/filter taps (no second
     # process ever opens the camera or audio device -- see media/ffmpeg.py
-    # is_live_video_copied()'s docstring on why that matters). Adds a small
-    # amount of CPU work during recording; if audio breakup ever returns,
-    # try disabling this before anything else.
-    live_preview_enabled: bool = True
+    # is_live_video_copied()'s docstring on why that matters). Off by
+    # default: a first real-hardware pass at this (bigger preview frame,
+    # astats printing everything, unbounded file re-reads) caused audio
+    # breakup and a mic meter that got choppier over a recording -- fixed
+    # (see media/ffmpeg.py, media/audio_levels.py), but this stays opt-in
+    # until that fix is confirmed on real hardware rather than defaulting
+    # back on. If enabling this ever causes audio breakup again, disable it
+    # before touching anything else.
+    live_preview_enabled: bool = False
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -226,7 +231,7 @@ class BoothConfig:
             if not audio_playback_device:
                 raise ConfigError("audio_playback_device must not be empty when set (use null to omit)")
 
-        live_preview_enabled = data.get("live_preview_enabled", True)
+        live_preview_enabled = data.get("live_preview_enabled", False)
         if not isinstance(live_preview_enabled, bool):
             raise ConfigError(f"live_preview_enabled must be a boolean, got {live_preview_enabled!r}")
 

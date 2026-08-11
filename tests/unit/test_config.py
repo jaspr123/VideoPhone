@@ -145,6 +145,22 @@ def test_audio_playback_device_rejects_empty_string():
         BoothConfig.from_dict(valid_config_dict(audio_playback_device=""))
 
 
+def test_live_preview_enabled_defaults_to_false():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.live_preview_enabled is False
+
+
+def test_live_preview_enabled_can_be_turned_on():
+    config = BoothConfig.from_dict(valid_config_dict(live_preview_enabled=True))
+    assert config.live_preview_enabled is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_live_preview_enabled_rejects_non_bool(value):
+    with pytest.raises(ConfigError, match="live_preview_enabled"):
+        BoothConfig.from_dict(valid_config_dict(live_preview_enabled=value))
+
+
 def test_missing_key_raises():
     data = valid_config_dict()
     del data["audio_device"]

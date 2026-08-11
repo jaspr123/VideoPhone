@@ -92,6 +92,14 @@ def classify_level(rms_dbfs: float, peak_dbfs: float) -> str:
 # handling here.
 _LIVE_LEVEL_RE = re.compile(r"lavfi\.astats\.1\.(Peak|RMS)_level=(-?(?:\d+\.\d+|inf))")
 
+# ffmpeg keeps *appending* to this file for the whole recording (there's no
+# "overwrite" mode for ametadata=print), so it only ever grows -- reading
+# the whole thing every render tick got measurably slower as a recording
+# went on (reported back as a meter that felt fine at first and choppier
+# over time). Each chunk is ~3 short lines (~100 bytes); this is a large
+# margin over that, not a tuned minimum.
+_LIVE_LEVEL_TAIL_BYTES = 4096
+
 
 def read_latest_live_level(path: Path) -> LevelReading | None:
     """Parse the most recent complete Peak+RMS pair from a live-level file.
@@ -101,9 +109,16 @@ def read_latest_live_level(path: Path) -> LevelReading | None:
     flushed) -- callers should keep showing their last known reading in
     that case, the same graceful-degradation approach used everywhere else
     live hardware feedback can be momentarily unavailable.
+
+    Only reads the tail of the file, not the whole thing -- see
+    _LIVE_LEVEL_TAIL_BYTES.
     """
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        with path.open("rb") as f:
+            f.seek(0, 2)  # end of file
+            size = f.tell()
+            f.seek(max(0, size - _LIVE_LEVEL_TAIL_BYTES))
+            text = f.read().decode("utf-8", errors="ignore")
     except OSError:
         return None
 

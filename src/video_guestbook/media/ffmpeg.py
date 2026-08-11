@@ -42,19 +42,32 @@ _SOFTWARE_ENCODE_PRESET = "ultrafast"
 _SOFTWARE_ENCODE_BITRATE = "4M"
 
 # Live preview/level feedback for the RECORDING screen (config
-# live_preview_enabled): a low-fps, small JPEG snapshot and a periodic mic
-# level readout, both produced as *extra* outputs/filter taps on this same
-# ffmpeg process -- never a second process opening the camera or audio
-# device. Verified against real ffmpeg (dual `-map` of the same input
-# stream, one `-c:v copy` and one filtered, plus the existing thread_queue_
-# size/wallclock/itsoffset flags together) using a raw elementary-stream
-# source (matching how v4l2/alsa deliver frames -- no pre-existing
-# container timestamps to conflict with -use_wallclock_as_timestamps,
-# unlike a pre-muxed file). Deliberately small/low-fps to keep the added
-# CPU cost well below a second real-time encode.
-_LIVE_PREVIEW_WIDTH = 480
-_LIVE_PREVIEW_FPS = 5
-_LIVE_PREVIEW_JPEG_QUALITY = "6"  # ffmpeg -q:v scale: 2 (best) .. 31 (worst)
+# live_preview_enabled, off by default -- see below): a low-fps, small
+# JPEG snapshot and a periodic mic level readout, both produced as *extra*
+# outputs/filter taps on this same ffmpeg process -- never a second
+# process opening the camera or audio device. Verified against real ffmpeg
+# (dual `-map` of the same input stream, one `-c:v copy` and one filtered,
+# plus the existing thread_queue_size/wallclock/itsoffset flags together)
+# using a raw elementary-stream source (matching how v4l2/alsa deliver
+# frames -- no pre-existing container timestamps to conflict with
+# -use_wallclock_as_timestamps, unlike a pre-muxed file). Deliberately
+# small/low-fps to keep the added CPU cost well below a second real-time
+# encode.
+#
+# First real-hardware pass at this used a bigger frame/higher fps and
+# printed astats' full ~20-metric metadata dump every 100ms with no bound
+# on file size, both across the whole recording -- reported back as the
+# mic meter getting choppier as a recording went on (re-reading and
+# re-parsing an ever-growing file every render tick) and as contributing
+# to audio breakup. Fixed by having astats compute/attach only the 2
+# metrics actually used (measure_perchannel/measure_overall below, not
+# ametadata's key= filter -- chaining two ametadata=print filters at the
+# same file was tried first and made ffmpeg hang, see CHANGELOG.md) and by
+# only ever reading the tail of the level file (see
+# audio_levels.read_latest_live_level), plus a lower preview fps/size.
+_LIVE_PREVIEW_WIDTH = 320
+_LIVE_PREVIEW_FPS = 2
+_LIVE_PREVIEW_JPEG_QUALITY = "8"  # ffmpeg -q:v scale: 2 (best) .. 31 (worst)
 _LIVE_LEVEL_CHUNK_SECONDS = 0.1  # matches the countdown-time mic check's cadence
 
 
@@ -166,8 +179,14 @@ def build_record_command(
     audio_filters = "aresample=async=1:first_pts=0"
     if live_level_path is not None:
         chunk_samples = max(1, int(config.audio_sample_rate * _LIVE_LEVEL_CHUNK_SECONDS))
+        # measure_perchannel/measure_overall restrict what astats computes
+        # and attaches in the first place -- this is what actually keeps
+        # each chunk small (~3 lines), not ametadata's key= option (see the
+        # comment above _LIVE_PREVIEW_WIDTH for why two chained
+        # ametadata=print filters at one file was tried and rejected).
         audio_filters += (
-            f",asetnsamples=n={chunk_samples},astats=metadata=1:reset=1"
+            f",asetnsamples=n={chunk_samples}"
+            ",astats=metadata=1:reset=1:measure_perchannel=Peak_level+RMS_level:measure_overall=none"
             f",ametadata=print:file={live_level_path}"
         )
 
