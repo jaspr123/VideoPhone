@@ -17,6 +17,26 @@ _BITRATE_RE = re.compile(r"^\d+k$")
 _VALID_INPUT_FORMATS = {"h264", "mjpeg"}
 _VALID_RECORDING_MODES = {"fast", "quality"}
 
+# Guestbook/Extended message-length presets exposed by the attendant
+# SETTINGS screen's segmented switch (see ui/renderer.py's render_settings
+# and main.py's _apply_settings_change). Flipping the switch sets
+# max_recording_seconds to the mode's default; an attendant can still dial
+# a custom value afterward with the +/- steppers.
+GUESTBOOK_MAX_RECORDING_SECONDS = 90
+EXTENDED_MAX_RECORDING_SECONDS = 300
+
+# Fields the attendant SETTINGS screen is allowed to persist back to the
+# config file (see BoothConfig.save_settings) -- everything else in
+# booth.default.json (camera/audio devices, GPIO pin, theme, hook switch,
+# etc.) is attendant-invisible and passes through a save untouched.
+EDITABLE_SETTINGS_KEYS = (
+    "max_recording_seconds",
+    "countdown_seconds",
+    "recording_mode",
+    "live_mic_meter_enabled",
+    "extended_mode",
+)
+
 REQUIRED_KEYS = (
     "camera_device",
     "record_resolution",
@@ -117,6 +137,13 @@ class BoothConfig:
     # preview -- config live_preview_enabled -- was removed once PREVIEW
     # took over showing a live feed; see CHANGELOG.md.)
     preview_seconds: int = 8
+    # Guestbook (short) vs Extended (long) message-length preset, set from
+    # the attendant SETTINGS screen's segmented switch. Purely descriptive
+    # of which preset max_recording_seconds currently reflects -- nothing
+    # else in the app reads this to change behavior; changing it is what
+    # changes max_recording_seconds in the first place (see
+    # ui/renderer.py's render_settings / main.py's _apply_settings_change).
+    extended_mode: bool = False
 
     @property
     def record_width_height(self) -> tuple[int, int]:
@@ -245,6 +272,10 @@ class BoothConfig:
         if not isinstance(preview_seconds, int) or preview_seconds <= 0:
             raise ConfigError(f"preview_seconds must be a positive integer, got {preview_seconds!r}")
 
+        extended_mode = data.get("extended_mode", False)
+        if not isinstance(extended_mode, bool):
+            raise ConfigError(f"extended_mode must be a boolean, got {extended_mode!r}")
+
         return cls(
             camera_device=camera_device,
             record_resolution=str(data["record_resolution"]).strip(),
@@ -268,6 +299,7 @@ class BoothConfig:
             audio_playback_device=audio_playback_device,
             live_mic_meter_enabled=live_mic_meter_enabled,
             preview_seconds=preview_seconds,
+            extended_mode=extended_mode,
         )
 
     @classmethod
@@ -287,3 +319,41 @@ class BoothConfig:
             raise ConfigError(f"Config file {path} must contain a JSON object")
 
         return cls.from_dict(data, base_dir=base_dir or Path.cwd())
+
+    @classmethod
+    def save_settings(
+        cls, path: str | Path, updates: dict[str, Any], base_dir: Path | None = None
+    ) -> "BoothConfig":
+        """Patch a subset of EDITABLE_SETTINGS_KEYS into the config JSON
+        file at `path` and return the reloaded, revalidated BoothConfig.
+
+        Used by the attendant SETTINGS screen (main.py's
+        _apply_settings_change) to persist edits made on the booth itself.
+        Everything else in the file (camera/audio devices, GPIO pin,
+        theme, hook switch, etc.) passes through untouched, and the merged
+        result is validated via from_dict *before* anything is written, so
+        a bad edit can't corrupt the file the booth needs to start up
+        next time.
+        """
+        path = Path(path)
+        unknown = set(updates) - set(EDITABLE_SETTINGS_KEYS)
+        if unknown:
+            raise ConfigError(f"save_settings got non-editable keys: {sorted(unknown)}")
+
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+        except OSError as exc:
+            raise ConfigError(f"Could not read config file {path}: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"Config file {path} is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ConfigError(f"Config file {path} must contain a JSON object")
+
+        merged = {**data, **updates}
+        config = cls.from_dict(merged, base_dir=base_dir or Path.cwd())  # validate before writing
+
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
+        return config

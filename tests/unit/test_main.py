@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -8,7 +9,14 @@ import pytest
 
 from video_guestbook import main as main_module
 from video_guestbook.config import BoothConfig
-from video_guestbook.main import _METER_CEILING_DBFS, _METER_FLOOR_DBFS, BoothApp, _mic_fraction
+from video_guestbook.main import (
+    _METER_CEILING_DBFS,
+    _METER_FLOOR_DBFS,
+    ADMIN_LONG_PRESS_SECONDS,
+    BoothApp,
+    _mic_fraction,
+    _point_in_rect,
+)
 from video_guestbook.media.audio_levels import LevelReading
 from video_guestbook.media.recorder import RecordingSession
 from video_guestbook.state_machine import BoothState
@@ -62,6 +70,28 @@ def _config(tmp_path, **overrides) -> BoothConfig:
 def _app(tmp_path, theme=None) -> BoothApp:
     theme = theme or Theme.load(THEME_DIR)
     return BoothApp(_config(tmp_path), theme, logging.getLogger("test"))
+
+
+def _config_dict(**overrides) -> dict:
+    data = {
+        "camera_device": "/dev/video0", "record_resolution": "1280x720", "record_fps": 30,
+        "record_input_format": "mjpeg", "audio_device": "plughw:CARD=Device,DEV=0",
+        "audio_sample_rate": 48000, "audio_channels": 1, "audio_bitrate": "160k",
+        "countdown_seconds": 3, "max_recording_seconds": 90, "output_dir": "recordings",
+        "log_dir": "logs", "preview_resolution": "1024x576", "preview_fps": 20,
+    }
+    data.update(overrides)
+    return data
+
+
+def _app_with_config_file(tmp_path, theme=None, **overrides) -> BoothApp:
+    """Like _app, but backed by a real config JSON file on disk, so
+    _save_settings (BoothConfig.save_settings) has somewhere to write."""
+    theme = theme or Theme.load(THEME_DIR)
+    config_path = tmp_path / "booth.json"
+    config_path.write_text(json.dumps(_config_dict(**overrides)), encoding="utf-8")
+    config = BoothConfig.from_dict(_config_dict(**overrides), base_dir=tmp_path)
+    return BoothApp(config, theme, logging.getLogger("test"), config_path=config_path, config_base_dir=tmp_path)
 
 
 def test_play_pickup_greeting_noop_when_theme_has_no_sound(tmp_path, monkeypatch):
@@ -326,3 +356,304 @@ def test_render_preview_state_uses_renderer_and_sets_button_rect(tmp_path):
 
     assert frame is not None
     assert app.renderer.record_button_rect is not None
+
+
+def test_render_countdown_state_uses_renderer(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.state_machine.transition(BoothState.COUNTDOWN)
+    app._countdown_deadline = time.monotonic() + 3
+
+    frame = app.render(None)
+
+    assert frame is not None
+
+
+def test_render_recording_state_uses_renderer_and_sets_cancel_rect(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.state_machine.transition(BoothState.COUNTDOWN)
+    app.state_machine.transition(BoothState.RECORDING)
+
+    frame = app.render(None)
+
+    assert frame is not None
+    assert app.renderer.cancel_button_rect is not None
+
+
+def test_render_settings_state_uses_renderer(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+
+    frame = app.render(None)
+
+    assert frame is not None
+    assert "save_exit" in app.renderer.settings_rects
+
+
+def test_render_developer_state_uses_renderer(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app.state_machine.transition(BoothState.DEVELOPER)
+
+    frame = app.render(None)
+
+    assert frame is not None
+    assert "back" in app.renderer.developer_rects
+
+
+# ── admin corner long-press ──────────────────────────────────────────
+
+
+def _admin_corner_point(app: BoothApp) -> tuple[int, int]:
+    return app.renderer.w - 5, app.renderer.h - 5
+
+
+def test_is_admin_corner_true_in_bottom_right_zone(tmp_path):
+    app = _app(tmp_path)
+    x, y = _admin_corner_point(app)
+    assert app._is_admin_corner(x, y) is True
+
+
+def test_is_admin_corner_false_elsewhere(tmp_path):
+    app = _app(tmp_path)
+    assert app._is_admin_corner(app.renderer.w // 2, app.renderer.h // 2) is False
+
+
+def test_long_press_in_admin_corner_opens_settings(tmp_path):
+    app = _app(tmp_path)
+    x, y = _admin_corner_point(app)
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, x, y, 0, None)
+    assert app._admin_press_started_at is not None
+    app._admin_press_started_at -= ADMIN_LONG_PRESS_SECONDS + 0.1  # simulate the hold
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONUP, x, y, 0, None)
+
+    assert app.state_machine.state == BoothState.SETTINGS
+
+
+def test_short_press_in_admin_corner_does_not_open_settings(tmp_path):
+    app = _app(tmp_path)
+    x, y = _admin_corner_point(app)
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, x, y, 0, None)
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONUP, x, y, 0, None)
+
+    assert app.state_machine.state == BoothState.READY
+
+
+def test_long_press_outside_corner_does_not_open_settings(tmp_path):
+    app = _app(tmp_path)
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, app.renderer.w // 2, app.renderer.h // 2, 0, None)
+    app._admin_press_started_at = time.monotonic() - (ADMIN_LONG_PRESS_SECONDS + 0.1)
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONUP, app.renderer.w // 2, app.renderer.h // 2, 0, None)
+
+    assert app.state_machine.state == BoothState.READY
+
+
+def test_long_press_ignored_outside_ready_state(tmp_path):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    x, y = _admin_corner_point(app)
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, x, y, 0, None)
+    assert app._admin_press_started_at is None
+
+
+# ── SETTINGS controls ────────────────────────────────────────────────
+
+
+def test_settings_message_length_stepper_persists(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app._apply_settings_action("msg_plus")
+    assert app.config.max_recording_seconds == 105
+    reloaded = json.loads(app.config_path.read_text(encoding="utf-8"))
+    assert reloaded["max_recording_seconds"] == 105
+
+
+def test_settings_message_length_stepper_floor(tmp_path):
+    app = _app_with_config_file(tmp_path, max_recording_seconds=15)
+    app._apply_settings_action("msg_minus")
+    assert app.config.max_recording_seconds == 15  # clamped, not negative
+
+
+def test_settings_countdown_stepper_persists(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app._apply_settings_action("cd_plus")
+    assert app.config.countdown_seconds == 4
+
+
+def test_settings_quality_compat_toggle(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app._apply_settings_action("compat")
+    assert app.config.recording_mode == "fast"
+    app._apply_settings_action("quality")
+    assert app.config.recording_mode == "quality"
+
+
+def test_settings_mic_toggle_flips_current_value(tmp_path):
+    app = _app_with_config_file(tmp_path, live_mic_meter_enabled=False)
+    app._apply_settings_action("mic_toggle")
+    assert app.config.live_mic_meter_enabled is True
+
+
+def test_settings_extended_mode_sets_default_seconds(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app._apply_settings_action("extended")
+    assert app.config.extended_mode is True
+    assert app.config.max_recording_seconds == main_module.EXTENDED_MAX_RECORDING_SECONDS
+
+    app._apply_settings_action("guestbook")
+    assert app.config.extended_mode is False
+    assert app.config.max_recording_seconds == main_module.GUESTBOOK_MAX_RECORDING_SECONDS
+
+
+def test_settings_developer_button_enters_developer_and_starts_mic_check(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+
+    app._apply_settings_action("developer")
+    try:
+        assert app.state_machine.state == BoothState.DEVELOPER
+        assert app._mic_check_thread is not None
+    finally:
+        app._stop_mic_check()
+
+
+def test_settings_save_exit_returns_to_ready(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+
+    app._apply_settings_action("save_exit")
+
+    assert app.state_machine.state == BoothState.READY
+
+
+@pytest.mark.parametrize("name", ["change_event", "create_event", "test_recording"])
+def test_settings_placeholder_buttons_are_noop(tmp_path, name):
+    app = _app_with_config_file(tmp_path)
+    before = app.config
+
+    app._apply_settings_action(name)
+
+    assert app.config is before  # nothing persisted
+
+
+def test_settings_tap_dispatches_by_rect(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app.render(None)  # populate renderer.settings_rects
+    x0, y0, x1, y1 = app.renderer.settings_rects["msg_plus"]
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, (x0 + x1) // 2, (y0 + y1) // 2, 0, None)
+
+    assert app.config.max_recording_seconds == 105
+
+
+# ── DEVELOPER controls ───────────────────────────────────────────────
+
+
+def test_developer_back_returns_to_settings_and_stops_mic_check(tmp_path):
+    app = _app_with_config_file(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app._apply_settings_action("developer")
+    assert app._mic_check_thread is not None
+
+    app._apply_developer_action("back")
+
+    assert app.state_machine.state == BoothState.SETTINGS
+    assert app._mic_check_thread is None
+
+
+@pytest.mark.parametrize("name", ["export_logs", "restart_booth"])
+def test_developer_unimplemented_buttons_are_noop(tmp_path, name):
+    app = _app_with_config_file(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app.state_machine.transition(BoothState.DEVELOPER)
+
+    app._apply_developer_action(name)
+
+    assert app.state_machine.state == BoothState.DEVELOPER
+
+
+# ── Cancel & restart ─────────────────────────────────────────────────
+
+
+def test_cancel_recording_discards_file_and_returns_to_preview(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.state_machine.transition(BoothState.COUNTDOWN)
+    app.state_machine.transition(BoothState.RECORDING)
+
+    discarded = tmp_path / "discarded.mp4"
+    discarded.write_bytes(b"fake video data")
+    session = _fake_session(tmp_path, live_output_path=discarded, final_output_path=discarded)
+    monkeypatch.setattr(app.recorder, "stop", lambda: session)
+    monkeypatch.setattr(app, "_reopen_camera_with_retry", lambda: True)
+
+    app._cancel_recording()
+
+    assert app.state_machine.state == BoothState.PREVIEW
+    assert not discarded.exists()
+    app._stop_mic_check()
+
+
+def test_cancel_recording_button_hit_test(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.PREVIEW)
+    app.state_machine.transition(BoothState.COUNTDOWN)
+    app.state_machine.transition(BoothState.RECORDING)
+    app.renderer.cancel_button_rect = (10, 10, 100, 60)
+    monkeypatch.setattr(app, "_cancel_recording", lambda: setattr(app, "_cancel_called", True))
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, 50, 30, 0, None)
+
+    assert getattr(app, "_cancel_called", False) is True
+
+
+# ── misc helpers ──────────────────────────────────────────────────────
+
+
+def test_point_in_rect():
+    rect = (10, 10, 100, 60)
+    assert _point_in_rect(50, 30, rect) is True
+    assert _point_in_rect(5, 30, rect) is False
+    assert _point_in_rect(50, 500, rect) is False
+
+
+def test_count_recordings_counts_only_mp4(tmp_path):
+    output_dir = tmp_path / "recordings"
+    output_dir.mkdir()
+    (output_dir / "a.mp4").write_bytes(b"x")
+    (output_dir / "b.mp4").write_bytes(b"x")
+    (output_dir / "c.raw.mkv").write_bytes(b"x")
+    (output_dir / "d.tmp").write_bytes(b"x")
+
+    assert main_module._count_recordings(output_dir) == 2
+
+
+def test_count_recordings_missing_dir_returns_zero(tmp_path):
+    assert main_module._count_recordings(tmp_path / "does-not-exist") == 0
+
+
+def test_developer_snapshot_has_expected_shape(tmp_path):
+    app = _app(tmp_path)
+    snapshot = app._developer_snapshot()
+    expected_keys = {
+        "camera_frame_bgr", "preview_fps", "camera_device", "dropped_frames",
+        "peak_db", "room_base_db", "clip_count", "mic_device", "hook_off_hook",
+        "hook_pin_state", "hook_held_seconds", "overlay_draw_ms", "cpu_temp_c",
+        "throttled", "cpu_load_pct", "mem_used_mb", "mem_total_mb",
+        "av_sync_offset_ms", "disk_free_gb", "disk_free_estimate_messages",
+        "encoder_status", "uptime_seconds", "last_error",
+    }
+    assert set(snapshot) == expected_keys
+    assert snapshot["encoder_status"] == "idle"
+    assert snapshot["last_error"] == "none"
+
+
+def test_developer_snapshot_reflects_last_result_reason(tmp_path):
+    app = _app(tmp_path)
+    app._last_result_reason = "camera read failed"
+    assert app._developer_snapshot()["last_error"] == "camera read failed"

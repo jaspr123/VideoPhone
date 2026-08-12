@@ -25,13 +25,21 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
 
 import cv2
 
-from video_guestbook.config import BoothConfig, ConfigError
+from video_guestbook.config import (
+    EXTENDED_MAX_RECORDING_SECONDS,
+    GUESTBOOK_MAX_RECORDING_SECONDS,
+    BoothConfig,
+    ConfigError,
+)
 from video_guestbook.hardware.hook_switch import HookSwitch, HookSwitchError
 from video_guestbook.logging_setup import get_session_adapter, setup_logging
 from video_guestbook.media.audio_levels import (
@@ -89,6 +97,25 @@ RECORDING_MIC_METER_START_DELAY_SECONDS = 1.0
 # touch it and instead shows the last frame captured before recording began.
 _CAMERA_RELEASED_STATES = frozenset({BoothState.RECORDING, BoothState.SAVING})
 
+# Attendant admin entry point (PROJECT_SPEC.md section 12, "long press in a
+# corner"): holding the bottom-right corner of the READY screen for this
+# long opens SETTINGS. Square hit zone, in the renderer's own w x h space
+# (see _is_admin_corner) -- untested against real touchscreen coordinates,
+# same caveat as record_button_rect (see main.py's _handle_mouse_down).
+ADMIN_CORNER_SIZE = 90
+ADMIN_LONG_PRESS_SECONDS = 1.6
+
+# Rough average finished-message file size, used only to turn raw disk-free
+# bytes into an attendant-legible "~N messages left" estimate on the
+# DEVELOPER screen. Not measured on this project's actual hardware/event
+# footage -- a guess to replace with a real figure once there's data.
+_ESTIMATED_BYTES_PER_MESSAGE = 50 * 1024 * 1024
+
+
+def _point_in_rect(x: int, y: int, rect: tuple[int, int, int, int]) -> bool:
+    x0, y0, x1, y1 = rect
+    return x0 <= x <= x1 and y0 <= y <= y1
+
 
 def _configure_capture(config: BoothConfig) -> cv2.VideoCapture:
     capture = cv2.VideoCapture(config.camera_device, cv2.CAP_V4L2)
@@ -115,11 +142,110 @@ def _mic_fraction(reading: LevelReading | None) -> float:
     )
 
 
+# ── DEVELOPER-screen hardware telemetry (best-effort, Linux/Pi-specific) ──
+# All of these return None (or a None-shaped tuple) on any failure rather
+# than raising -- see BoothApp._developer_snapshot, which is the only
+# caller. None of this has been run against real Pi hardware in this
+# sandbox; treat the values as unverified until checked on-device.
+
+
+def _vcgencmd_temp_c() -> float | None:
+    path = shutil.which("vcgencmd")
+    if not path:
+        return None
+    try:
+        out = subprocess.run([path, "measure_temp"], capture_output=True, text=True, timeout=1.0).stdout
+        # e.g. "temp=58.4'C"
+        return float(out.strip().split("=")[1].split("'")[0])
+    except (OSError, subprocess.TimeoutExpired, IndexError, ValueError):
+        return None
+
+
+def _vcgencmd_throttled() -> bool | None:
+    path = shutil.which("vcgencmd")
+    if not path:
+        return None
+    try:
+        out = subprocess.run([path, "get_throttled"], capture_output=True, text=True, timeout=1.0).stdout
+        # e.g. "throttled=0x50000" -- any bit set means under-voltage,
+        # frequency capping or throttling has occurred (see vcgencmd docs).
+        value = int(out.strip().split("=")[1], 16)
+        return value != 0
+    except (OSError, subprocess.TimeoutExpired, IndexError, ValueError):
+        return None
+
+
+def _cpu_load_pct() -> float | None:
+    try:
+        load_1min = os.getloadavg()[0]
+        cpu_count = os.cpu_count() or 1
+        return max(0.0, min(100.0, (load_1min / cpu_count) * 100))
+    except OSError:
+        return None
+
+
+def _mem_used_total_mb() -> tuple[float, float] | None:
+    try:
+        fields: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    fields[key] = int(rest.strip().split()[0])  # kB
+        if "MemTotal" not in fields or "MemAvailable" not in fields:
+            return None
+        total_mb = fields["MemTotal"] / 1024
+        used_mb = total_mb - fields["MemAvailable"] / 1024
+        return used_mb, total_mb
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _disk_free_gb(path: Path) -> float | None:
+    try:
+        return shutil.disk_usage(path).free / (1024**3)
+    except OSError:
+        return None
+
+
+def _disk_free_estimate_messages(path: Path) -> int | None:
+    try:
+        free_bytes = shutil.disk_usage(path).free
+    except OSError:
+        return None
+    return int(free_bytes / _ESTIMATED_BYTES_PER_MESSAGE)
+
+
+def _count_recordings(output_dir: Path) -> int:
+    """Finished-message count for the SETTINGS storage row: final .mp4
+    files only -- not raw .mkv captures still waiting on the transcode
+    queue (see media/transcode.py) or stray .tmp files."""
+    try:
+        return sum(1 for p in output_dir.glob("*.mp4") if p.is_file())
+    except OSError:
+        return 0
+
+
 class BoothApp:
-    def __init__(self, config: BoothConfig, theme: Theme, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        config: BoothConfig,
+        theme: Theme,
+        logger: logging.Logger,
+        config_path: Path = DEFAULT_CONFIG_PATH,
+        config_base_dir: Path = PROJECT_ROOT,
+    ) -> None:
         self.config = config
         self.theme = theme
         self.logger = logger
+        # Kept so SETTINGS can persist edits back to the same file this
+        # config was loaded from, resolving the same relative paths
+        # (output_dir/log_dir/theme_dir) the same way load_config() did
+        # (see BoothConfig.save_settings / _save_settings below).
+        # Distinct from config itself, which is replaced wholesale on
+        # every successful save.
+        self.config_path = config_path
+        self.config_base_dir = config_base_dir
         self.state_machine = StateMachine(logger=logger)
         self.recorder = Recorder(config, logger=logger)
         self.transcode_queue = TranscodeQueue(config, logger=logger)
@@ -128,6 +254,7 @@ class BoothApp:
         self._last_frame = None
         self._countdown_deadline: float | None = None
         self._state_entered_at: float = time.monotonic()
+        self._app_started_at: float = time.monotonic()
         self._last_result_reason: str = ""
         self._session_log = get_session_adapter(logger, "-")
 
@@ -148,6 +275,21 @@ class BoothApp:
 
         self.hook_switch: HookSwitch | None = None
         self._hook_switch_was_lifted = False
+        self._hook_state_changed_at: float = time.monotonic()
+
+        # DEVELOPER screen telemetry (see _developer_snapshot): a small
+        # rolling window of successful _read_frame() timestamps for a live
+        # fps estimate, a running count of failed reads, and the previous
+        # frame's total render() cost. All best-effort / display-only --
+        # nothing here feeds back into guest-facing behavior.
+        self._frame_times: list[float] = []
+        self._dropped_frames: int = 0
+        self._last_render_ms: float = 0.0
+
+        # Long-press-to-admin tracking (see ADMIN_CORNER_SIZE /
+        # ADMIN_LONG_PRESS_SECONDS and _handle_mouse_down/_handle_mouse_up).
+        # None whenever no corner-press is currently in progress.
+        self._admin_press_started_at: float | None = None
 
     def open_hook_switch(self) -> None:
         """Best-effort: missing/failed GPIO must not crash the app (rule 17).
@@ -183,6 +325,8 @@ class BoothApp:
 
         just_lifted = lifted and not self._hook_switch_was_lifted
         just_replaced = (not lifted) and self._hook_switch_was_lifted
+        if just_lifted or just_replaced:
+            self._hook_state_changed_at = time.monotonic()
         self._hook_switch_was_lifted = lifted
 
         state = self.state_machine.state
@@ -483,6 +627,157 @@ class BoothApp:
             self._last_result_reason = result.reason
             self._enter_state(BoothState.ERROR)
 
+    def _cancel_recording(self) -> None:
+        """RECORDING's guest-facing "Cancel & restart" action: stop ffmpeg,
+        discard whatever it wrote (this take was never validated or
+        offered to the guest, so it isn't a "failed" recording -- just
+        silently removed), reopen the camera and return to PREVIEW rather
+        than SAVING/ERROR. See state_machine.py's module docstring for why
+        RECORDING -> PREVIEW is a valid transition.
+        """
+        try:
+            session = self.recorder.stop()
+        except RecorderError as exc:
+            self.logger.warning("cancel & restart: recorder.stop() failed (%s), continuing anyway", exc)
+            session = None
+        if session is not None:
+            for path in {session.live_output_path, session.final_output_path}:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    self.logger.warning("cancel & restart: could not remove discarded file %s", path)
+            self._session_log.info("recording cancelled by guest, discarded %s", session.live_output_path)
+        self._reopen_camera_with_retry()
+        self._start_preview()
+
+    def _is_admin_corner(self, x: int, y: int) -> bool:
+        w, h = self.renderer.w, self.renderer.h
+        return x >= w - ADMIN_CORNER_SIZE and y >= h - ADMIN_CORNER_SIZE
+
+    def _enter_settings(self) -> None:
+        self._enter_state(BoothState.SETTINGS)
+
+    def _leave_settings_to_ready(self) -> None:
+        self._enter_state(BoothState.READY)
+
+    def _enter_developer(self) -> None:
+        self._enter_state(BoothState.DEVELOPER)
+        # Live mic level on DEVELOPER reuses the same countdown-time
+        # mechanism as everywhere else (see _start_mic_check); harmless to
+        # start fresh here since nothing else is using it in SETTINGS.
+        self._start_mic_check(context="developer")
+
+    def _leave_developer_to_settings(self) -> None:
+        self._stop_mic_check()
+        self._enter_state(BoothState.SETTINGS)
+
+    def _save_settings(self, updates: dict) -> None:
+        """Persist an attendant edit from SETTINGS to the config file this
+        app was started with, then adopt the reloaded, revalidated config
+        immediately -- so e.g. a new max_recording_seconds takes effect on
+        the very next recording without restarting the booth. Best-effort
+        (rule 17): a write/validation failure is logged and the previous
+        in-memory config is left in place rather than crashing the admin
+        screen.
+        """
+        try:
+            self.config = BoothConfig.save_settings(self.config_path, updates, base_dir=self.config_base_dir)
+            self.logger.info("settings saved: %s", updates)
+        except ConfigError as exc:
+            self.logger.error("failed to save settings %s: %s", updates, exc)
+
+    def _apply_settings_action(self, name: str) -> None:
+        if name == "msg_minus":
+            self._save_settings({"max_recording_seconds": max(15, self.config.max_recording_seconds - 15)})
+        elif name == "msg_plus":
+            self._save_settings({"max_recording_seconds": min(600, self.config.max_recording_seconds + 15)})
+        elif name == "cd_minus":
+            self._save_settings({"countdown_seconds": max(0, self.config.countdown_seconds - 1)})
+        elif name == "cd_plus":
+            self._save_settings({"countdown_seconds": min(10, self.config.countdown_seconds + 1)})
+        elif name == "quality":
+            self._save_settings({"recording_mode": "quality"})
+        elif name == "compat":
+            self._save_settings({"recording_mode": "fast"})
+        elif name == "mic_toggle":
+            self._save_settings({"live_mic_meter_enabled": not self.config.live_mic_meter_enabled})
+        elif name in ("guestbook", "extended"):
+            extended = name == "extended"
+            default_seconds = EXTENDED_MAX_RECORDING_SECONDS if extended else GUESTBOOK_MAX_RECORDING_SECONDS
+            self._save_settings({"extended_mode": extended, "max_recording_seconds": default_seconds})
+        elif name == "developer":
+            self._enter_developer()
+        elif name == "save_exit":
+            self._leave_settings_to_ready()
+        elif name in ("change_event", "create_event", "test_recording"):
+            # UI-only placeholders -- no multi-event config schema yet
+            # (PROJECT_SPEC.md section 10 is an explicitly later
+            # milestone) and no automated self-test recording path.
+            self.logger.info("Settings: %r tapped -- not implemented yet, ignoring", name)
+
+    def _apply_developer_action(self, name: str) -> None:
+        if name == "back":
+            self._leave_developer_to_settings()
+        elif name in ("export_logs", "restart_booth"):
+            # Neither has a real implementation yet (no log bundling, no
+            # process supervisor to restart under) -- log the tap so it's
+            # visible during a real admin session rather than doing
+            # nothing silently.
+            self.logger.info("Developer: %r tapped -- not implemented yet, ignoring", name)
+
+    def _developer_snapshot(self) -> dict:
+        """Best-effort hardware/process telemetry for the DEVELOPER screen
+        (see ui/renderer.py's render_developer). Every value is read fresh
+        (cheap; this only runs while an attendant has DEVELOPER open, never
+        during the guest flow) and never raises -- a failed read degrades
+        to None/"n/a" rather than taking the admin screen down (rule 17).
+        Several fields (vcgencmd temp/throttling, /proc/meminfo, /proc/
+        uptime) are Linux/Pi-specific and simply report None off that
+        platform.
+        """
+        with self._mic_readings_lock:
+            latest = self._latest_mic_reading
+            readings = list(self._mic_readings[-600:])  # ~last 60s at 100ms/reading
+
+        peak_db = latest.peak_dbfs if latest is not None else -60.0
+        room_base_db = min((r.rms_dbfs for r in readings), default=peak_db)
+        clip_count = sum(1 for r in readings if r.clipped)
+
+        now = time.monotonic()
+        fps = 0.0
+        if len(self._frame_times) >= 2:
+            span = self._frame_times[-1] - self._frame_times[0]
+            if span > 0:
+                fps = (len(self._frame_times) - 1) / span
+
+        mem = _mem_used_total_mb()
+
+        return {
+            "camera_frame_bgr": self._last_frame,
+            "preview_fps": fps,
+            "camera_device": self.config.camera_device,
+            "dropped_frames": self._dropped_frames,
+            "peak_db": peak_db,
+            "room_base_db": room_base_db,
+            "clip_count": clip_count,
+            "mic_device": self.config.audio_device,
+            "hook_off_hook": self._hook_switch_was_lifted,
+            "hook_pin_state": "LOW" if self._hook_switch_was_lifted else "HIGH",
+            "hook_held_seconds": max(0.0, now - self._hook_state_changed_at),
+            "overlay_draw_ms": self._last_render_ms,
+            "cpu_temp_c": _vcgencmd_temp_c(),
+            "throttled": _vcgencmd_throttled(),
+            "cpu_load_pct": _cpu_load_pct(),
+            "mem_used_mb": mem[0] if mem else None,
+            "mem_total_mb": mem[1] if mem else None,
+            "av_sync_offset_ms": self.config.av_sync_offset_ms,
+            "disk_free_gb": _disk_free_gb(self.config.output_dir),
+            "disk_free_estimate_messages": _disk_free_estimate_messages(self.config.output_dir),
+            "encoder_status": "recording" if self.recorder.is_running else "idle",
+            "uptime_seconds": now - self._app_started_at,
+            "last_error": self._last_result_reason or "none",
+        }
+
     def handle_key(self, key: int) -> bool:
         """Returns False if the app should quit."""
         if key in (KEY_Q, KEY_ESCAPE):
@@ -505,25 +800,61 @@ class BoothApp:
         return True
 
     def _on_mouse(self, event: int, x: int, y: int, flags: int, userdata: object) -> None:
-        """Touch/click handling for the PREVIEW screen's record button.
+        """Touch/click handling, dispatched by event type and current state.
 
-        Best-effort (rule 17): if record_button_rect hasn't been set yet
-        (no PREVIEW frame rendered yet) this just does nothing rather than
-        raising. preview_seconds' auto-advance is the safety net if a
-        touchscreen's coordinates don't line up with this rect on a given
-        piece of hardware -- see config.py.
+        Best-effort throughout (rule 17): every rect this consults may be
+        None if the relevant screen hasn't rendered a frame yet, in which
+        case the tap is simply dropped rather than raising. Coordinates
+        are assumed to already be in the renderer's own w x h space (see
+        ADMIN_CORNER_SIZE) -- untested against a real touchscreen's
+        reported coordinates on the physical 7-inch panel.
         """
-        if event != cv2.EVENT_LBUTTONDOWN:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._handle_mouse_down(x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._handle_mouse_up(x, y)
+
+    def _handle_mouse_down(self, x: int, y: int) -> None:
+        state = self.state_machine.state
+
+        if state == BoothState.READY and self._is_admin_corner(x, y):
+            self._admin_press_started_at = time.monotonic()
             return
-        if self.state_machine.state != BoothState.PREVIEW:
+        self._admin_press_started_at = None
+
+        if state == BoothState.PREVIEW:
+            rect = self.renderer.record_button_rect
+            if rect is not None and _point_in_rect(x, y, rect):
+                self.logger.info("record button tapped")
+                self._start_countdown()
+        elif state == BoothState.RECORDING:
+            rect = self.renderer.cancel_button_rect
+            if rect is not None and _point_in_rect(x, y, rect):
+                self.logger.info("cancel & restart tapped")
+                self._cancel_recording()
+        elif state == BoothState.SETTINGS:
+            for name, rect in self.renderer.settings_rects.items():
+                if _point_in_rect(x, y, rect):
+                    self._apply_settings_action(name)
+                    break
+        elif state == BoothState.DEVELOPER:
+            for name, rect in self.renderer.developer_rects.items():
+                if _point_in_rect(x, y, rect):
+                    self._apply_developer_action(name)
+                    break
+
+    def _handle_mouse_up(self, x: int, y: int) -> None:
+        if self._admin_press_started_at is None:
             return
-        rect = self.renderer.record_button_rect
-        if rect is None:
-            return
-        x0, y0, x1, y1 = rect
-        if x0 <= x <= x1 and y0 <= y <= y1:
-            self.logger.info("record button tapped")
-            self._start_countdown()
+        held = time.monotonic() - self._admin_press_started_at
+        self._admin_press_started_at = None
+        if (
+            self.state_machine.state == BoothState.READY
+            and self._is_admin_corner(x, y)
+            and held >= ADMIN_LONG_PRESS_SECONDS
+        ):
+            self.logger.info("admin corner long-press (%.2fs), opening Settings", held)
+            self._enter_settings()
 
     def tick(self) -> None:
         """Advance time-based transitions (countdown expiry, auto-stop, timeouts)."""
@@ -577,10 +908,15 @@ class BoothApp:
             )
         elif state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
             remaining = max(0.0, self._countdown_deadline - now)
-            mic_status = latest_mic_reading.status if latest_mic_reading is not None else None
-            mic_fraction = _mic_fraction(latest_mic_reading) if latest_mic_reading is not None else None
+            # Genuinely live here too (see state_machine.py's module
+            # docstring) -- ffmpeg still hasn't touched the camera.
             return self.renderer.render_countdown(
-                now, remaining, self.config.countdown_seconds, mic_status, mic_fraction
+                now,
+                remaining,
+                self.config.countdown_seconds,
+                frame,
+                _mic_fraction(latest_mic_reading) if latest_mic_reading is not None else None,
+                bool(latest_mic_reading and latest_mic_reading.clipped),
             )
         elif state == BoothState.RECORDING:
             elapsed = now - self._state_entered_at
@@ -594,7 +930,6 @@ class BoothApp:
             return self.renderer.render_recording(
                 now,
                 frame,
-                int(elapsed),
                 remaining,
                 _mic_fraction(latest_mic_reading),
                 bool(latest_mic_reading and latest_mic_reading.clipped),
@@ -605,6 +940,26 @@ class BoothApp:
             return self.renderer.render_saved(now, now - self._state_entered_at)
         elif state == BoothState.ERROR:
             return self.renderer.render_error(now, self._last_result_reason)
+        elif state == BoothState.SETTINGS:
+            return self.renderer.render_settings(
+                now,
+                max_recording_seconds=self.config.max_recording_seconds,
+                countdown_seconds=self.config.countdown_seconds,
+                recording_mode=self.config.recording_mode,
+                live_mic_meter_enabled=self.config.live_mic_meter_enabled,
+                extended_mode=self.config.extended_mode,
+                message_count=_count_recordings(self.config.output_dir),
+                storage_free_gb=_disk_free_gb(self.config.output_dir) or 0.0,
+                camera_ok=self.capture is not None and self.capture.isOpened(),
+                camera_device=self.config.camera_device,
+                mic_ok=shutil.which("arecord") is not None,
+                mic_device=self.config.audio_device,
+                hook_ok=self.hook_switch is not None,
+                hook_label=("Off hook" if self._hook_switch_was_lifted else "On hook") + f" · GPIO {self.config.hook_switch_gpio_pin}",
+                theme_name=self.theme.name,
+            )
+        elif state == BoothState.DEVELOPER:
+            return self.renderer.render_developer(now, **self._developer_snapshot())
 
         return self.renderer.render_ready(now)
 
@@ -618,7 +973,10 @@ class BoothApp:
             ok, frame = self.capture.read()
             if ok:
                 self._last_frame = frame
+                self._frame_times.append(time.monotonic())
+                del self._frame_times[:-30]
             else:
+                self._dropped_frames += 1
                 self.logger.error("camera read failed")
                 if not self._reopen_camera_with_retry():
                     if self.state_machine.state != BoothState.ERROR:
@@ -639,7 +997,9 @@ class BoothApp:
             while running:
                 frame = self._read_frame()
                 self.tick()
+                render_started = time.perf_counter()
                 display = self.render(frame)
+                self._last_render_ms = (time.perf_counter() - render_started) * 1000
                 cv2.imshow(WINDOW_NAME, display)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -688,7 +1048,7 @@ def main() -> int:
     logger = setup_logging(config.log_dir)
     logger.info("booth starting with config %s, theme %s", args.config, theme.name)
 
-    app = BoothApp(config, theme, logger)
+    app = BoothApp(config, theme, logger, config_path=args.config)
     try:
         app.run()
     except Exception:

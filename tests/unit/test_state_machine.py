@@ -74,8 +74,47 @@ def test_can_transition_matches_transition_behavior():
         (BoothState.SAVING, False),
         (BoothState.SAVED, False),
         (BoothState.ERROR, False),
+        (BoothState.SETTINGS, False),
+        (BoothState.DEVELOPER, False),
     ],
 )
 def test_guest_input_ignored_during_saving(state, expected):
     sm = StateMachine(initial_state=state)
     assert sm.accepts_guest_input is expected
+
+
+def test_admin_screens_reachable_from_ready_and_back():
+    sm = StateMachine()
+    sm.transition(BoothState.SETTINGS)
+    assert sm.state == BoothState.SETTINGS
+    sm.transition(BoothState.DEVELOPER)
+    assert sm.state == BoothState.DEVELOPER
+    sm.transition(BoothState.SETTINGS)
+    sm.transition(BoothState.READY)
+    assert sm.state == BoothState.READY
+
+
+def test_recording_can_cancel_back_to_preview():
+    sm = StateMachine()
+    sm.transition(BoothState.PREVIEW)
+    sm.transition(BoothState.COUNTDOWN)
+    sm.transition(BoothState.RECORDING)
+    sm.transition(BoothState.PREVIEW)
+    assert sm.state == BoothState.PREVIEW
+
+
+@pytest.mark.parametrize(
+    "start,target",
+    [
+        (BoothState.SETTINGS, BoothState.PREVIEW),
+        (BoothState.SETTINGS, BoothState.RECORDING),
+        (BoothState.DEVELOPER, BoothState.READY),
+        (BoothState.DEVELOPER, BoothState.PREVIEW),
+        (BoothState.PREVIEW, BoothState.SETTINGS),
+        (BoothState.COUNTDOWN, BoothState.PREVIEW),
+    ],
+)
+def test_admin_transitions_stay_scoped(start, target):
+    sm = StateMachine(initial_state=start)
+    with pytest.raises(InvalidTransitionError):
+        sm.transition(target)

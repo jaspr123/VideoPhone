@@ -1,8 +1,9 @@
+import json
 from pathlib import Path
 
 import pytest
 
-from video_guestbook.config import BoothConfig, ConfigError
+from video_guestbook.config import EDITABLE_SETTINGS_KEYS, BoothConfig, ConfigError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "booth.default.json"
@@ -255,3 +256,76 @@ def test_json_array_raises(tmp_path):
     bad_file.write_text("[]", encoding="utf-8")
     with pytest.raises(ConfigError, match="must contain a JSON object"):
         BoothConfig.from_file(bad_file)
+
+
+def test_extended_mode_defaults_to_false():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.extended_mode is False
+
+
+def test_extended_mode_can_be_turned_on():
+    config = BoothConfig.from_dict(valid_config_dict(extended_mode=True))
+    assert config.extended_mode is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_extended_mode_rejects_non_bool(value):
+    with pytest.raises(ConfigError, match="extended_mode"):
+        BoothConfig.from_dict(valid_config_dict(extended_mode=value))
+
+
+def _write_config_file(tmp_path: Path, **overrides) -> Path:
+    path = tmp_path / "booth.json"
+    path.write_text(json.dumps(valid_config_dict(**overrides)), encoding="utf-8")
+    return path
+
+
+def test_save_settings_persists_editable_field(tmp_path):
+    path = _write_config_file(tmp_path)
+    config = BoothConfig.save_settings(path, {"max_recording_seconds": 300}, base_dir=tmp_path)
+    assert config.max_recording_seconds == 300
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert reloaded["max_recording_seconds"] == 300
+
+
+def test_save_settings_preserves_untouched_keys(tmp_path):
+    path = _write_config_file(tmp_path, camera_device="/dev/video1")
+    BoothConfig.save_settings(path, {"countdown_seconds": 5}, base_dir=tmp_path)
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert reloaded["camera_device"] == "/dev/video1"
+    assert reloaded["countdown_seconds"] == 5
+
+
+def test_save_settings_rejects_non_editable_key(tmp_path):
+    path = _write_config_file(tmp_path)
+    with pytest.raises(ConfigError, match="non-editable"):
+        BoothConfig.save_settings(path, {"camera_device": "/dev/video1"}, base_dir=tmp_path)
+    # File must be untouched by a rejected update.
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert reloaded["camera_device"] == "/dev/video0"
+
+
+def test_save_settings_rejects_invalid_value_without_writing(tmp_path):
+    path = _write_config_file(tmp_path)
+    original = path.read_text(encoding="utf-8")
+    with pytest.raises(ConfigError):
+        BoothConfig.save_settings(path, {"countdown_seconds": -1}, base_dir=tmp_path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_save_settings_covers_every_editable_key(tmp_path):
+    path = _write_config_file(tmp_path)
+    updates = {
+        "max_recording_seconds": 120,
+        "countdown_seconds": 5,
+        "recording_mode": "fast",
+        "live_mic_meter_enabled": True,
+        "extended_mode": True,
+    }
+    assert set(updates) == set(EDITABLE_SETTINGS_KEYS)
+    config = BoothConfig.save_settings(path, updates, base_dir=tmp_path)
+    assert config.max_recording_seconds == 120
+    assert config.countdown_seconds == 5
+    assert config.recording_mode == "fast"
+    assert config.live_mic_meter_enabled is True
+    assert config.extended_mode is True

@@ -1,5 +1,110 @@
 # Changelog
 
+## Unreleased — Guest-screen visual refresh + attendant Settings/Developer screens
+
+Implements the Claude Design handoff (`9 Developer.dc.html`, `1 Welcome.dc.html`,
+and the rest of the 9-screen "Guestbook Kiosk" mockup set) end to end:
+brings the six existing guest screens' `ui/renderer.py` code up to date
+with a long run of mockup-only edits that had never been ported back
+(headline-over-preview, the horizontal sound-check meter, the tips column,
+camera blur, the enlarged Tap to Record button, the unified single-line
+header), applies the previously-proposed ERROR redesign and static-layer
+caching from `renderer-patch-notes.md`, and adds two brand-new attendant
+screens (SETTINGS, DEVELOPER) that didn't exist in the app at all before
+this pass.
+
+- **`ui/renderer.py`**: every screen's layout rewritten to match the final
+  mockups pixel-for-pixel at 1024x576 (see the mockup files for the design
+  source of truth):
+  - Replaced the old vertical VU-style mic meter (`_camera_and_meter_row`,
+    `_mic_meter`) with a full-width camera panel (`_camera_panel`), a
+    right-hand tips column (`_tips_column`: camera/mic/smile icons, reused
+    from the old COUNTDOWN screen), and a horizontal sound-check bar
+    (`_sound_check_bar`) pinned at the same (36,444,824,~50) coordinates on
+    GET READY, COUNTDOWN and RECORDING so it holds still as the guest
+    moves between them.
+  - `_couple_header_bar`: the compact "NAMES · gold hairline · DATE" row
+    now shared by GET READY, COUNTDOWN, RECORDING, SAVING, SAVED and
+    ERROR (previously SAVING/SAVED/ERROR had their own two-line stacked
+    header, or none at all). Nudged to y=46px (from the design's y=24px)
+    because this theme's actual frame art has corner foliage that clips
+    "2024" at y=24 -- the mockup's stand-in background photo didn't have
+    that problem.
+  - WELCOME (`render_ready`): fixed content-column centering (374px) and a
+    fixed couple-photo panel (700,61,300,408), replacing the old
+    photo-width-dependent layout math.
+  - COUNTDOWN now shows the (blurred) live/frozen camera feed behind the
+    ring -- previously it showed no camera at all, despite
+    state_machine.py's own docstring already documenting that the feed is
+    genuinely live at that point. `render_countdown` and `main.py`'s
+    `render()` dispatch were updated to pass a camera frame through.
+  - RECORDING rebuilt on the GET READY base per the design brief ("make
+    the record page look just like the get ready page"): blurred still
+    frame, "Now Recording" overlay, status pill with only the remaining
+    time (elapsed dropped -- the design no longer shows it), and a new
+    **Cancel & restart** button.
+  - ERROR: applied `renderer-patch-notes.md`'s proposed redesign (gold
+    divider + a bounded, word-wrapped cream card for the reason string via
+    the new module-level `_wrap_text`), plus the header bar.
+  - **Static-layer caching** (`_static_layer`, per the patch notes):
+    WELCOME, SAVING, SAVED and ERROR now render their non-animated chrome
+    once and reuse a cached copy every frame, redrawing only the
+    footer-diamond pulse / spinner arc / checkmark stroke-on / (nothing,
+    for ERROR) on top. GET READY, COUNTDOWN and RECORDING are left
+    uncached, as the patch notes suggested -- the live/blurred camera
+    panel dominates their per-frame cost either way. **Not perf-tested**:
+    no Pi or real camera in this sandbox. On-device checklist: run the
+    current build, compare PREVIEW/COUNTDOWN/RECORDING/WELCOME frame
+    pacing against a pre-change build; also watch ERROR's static-layer
+    cache size in a long-running session (it's keyed on the reason
+    string, so a validation/recorder failure message that embeds
+    per-instance detail, e.g. a timestamp, would grow it unboundedly --
+    today's actual failure reasons are a small fixed set of strings, so
+    this is believed fine, but wasn't exercised against real failure
+    traffic).
+- **New `SETTINGS` and `DEVELOPER` states** (`state_machine.py`):
+  `READY <-> SETTINGS <-> DEVELOPER`, reachable only from `READY` and
+  never part of `GUEST_INPUT_STATES`. Also added `RECORDING -> PREVIEW`
+  for the new Cancel & restart action.
+- **Admin entry point**: holding the bottom-right 90x90px corner of the
+  READY screen for 1.6s opens SETTINGS (`main.py`'s
+  `ADMIN_CORNER_SIZE`/`ADMIN_LONG_PRESS_SECONDS`, `_handle_mouse_down`/
+  `_handle_mouse_up`). This was the one open design question the mockup
+  chat never got an answer to; picked long-press over a keyboard shortcut
+  since the physical booth has no keyboard exposed to guests. **Untested
+  against a real touchscreen's reported coordinates** -- same caveat the
+  original PREVIEW record-button hit-testing already carried.
+- **`config.py`**: new `extended_mode` field (Guestbook 90s / Extended
+  300s presets, `GUESTBOOK_MAX_RECORDING_SECONDS` /
+  `EXTENDED_MAX_RECORDING_SECONDS`) and `BoothConfig.save_settings()` --
+  validates a patch of `EDITABLE_SETTINGS_KEYS` against the full config
+  schema *before* writing, then writes atomically (temp file + rename) so
+  a bad attendant edit can never corrupt `booth.default.json`.
+- **`main.py`**: SETTINGS wires the message-length/countdown steppers,
+  Quality/Compat and Guestbook/Extended segmented controls, and the live
+  mic meter toggle to real config reads/writes via `_apply_settings_action`
+  / `_save_settings`, applied immediately (no restart needed). "Create new
+  event", "Change event" and "Test recording" are intentionally **UI-only
+  placeholders** -- there's no multi-event config schema yet
+  (PROJECT_SPEC.md section 10 is an explicitly later milestone); tapping
+  them just logs and no-ops. DEVELOPER's "Export logs" and "Restart booth"
+  are the same: logged, not implemented. `_cancel_recording` stops
+  ffmpeg, deletes the discarded file, and returns to PREVIEW.
+  `_developer_snapshot` gathers camera fps/dropped-frame counts (new
+  rolling counters), mic peak/room-base/clip-count (reusing the existing
+  `AudioLevelReader` mic-check machinery, started/stopped on
+  DEVELOPER entry/exit), hook-switch state (already polled every frame),
+  and CPU temp/throttling (`vcgencmd`), CPU load/memory (`/proc`), disk
+  free (`shutil.disk_usage`), encoder status and uptime -- all
+  **best-effort and Linux/Pi-specific**, degrading to `None`/"n/a" off
+  that platform or without `vcgencmd`, never raising.
+- Added/updated `tests/unit/test_renderer.py`, `test_state_machine.py`,
+  `test_config.py`, `test_main.py` for every signature change above plus
+  new coverage (SETTINGS/DEVELOPER rendering and rect population, the
+  admin long-press flow, settings persistence round-trips including
+  rejected/invalid edits, cancel & restart, `_developer_snapshot`'s
+  shape). Full suite (348 tests) passes.
+
 ## Unreleased — New PREVIEW screen: live camera before recording, not during
 
 User's idea after three rounds of RECORDING-time live-preview trouble: "what
