@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased — DEVELOPER: "Find receiver switch" wizard
+
+Real-hardware feedback from the first Pi test of the Settings/Developer
+screens: the receiver hook switch wasn't registering lift/hang-up at all,
+and the DEVELOPER screen's Receiver card never changed either -- consistent
+with either the switch being wired to a different GPIO pin than
+`hook_switch_gpio_pin`, or being a normally-closed switch (reading the
+opposite of what the code assumed).
+
+- **`hardware/hook_switch.py`**: `HookSwitch` gained an `invert` parameter
+  (default `False`, matching the previously-hardcoded normally-open
+  assumption). Flips `is_lifted`'s interpretation for a normally-closed
+  switch wired the same GND-only way the spec requires -- this is a
+  different axis from *which pin* it's on, and both can be wrong
+  independently.
+- **`config.py`**: new `hook_switch_invert` field (validated bool,
+  default `False`), and `hook_switch_gpio_pin`/`hook_switch_invert` added
+  to `EDITABLE_SETTINGS_KEYS` so the wizard below can persist through the
+  same validate-before-write `BoothConfig.save_settings` path SETTINGS
+  already uses, rather than a separate one.
+- **New DEVELOPER control, "Find switch"** (next to the Receiver card):
+  opens a live-monitor wizard rather than having software guess a pin/
+  polarity from timing windows it has no way to verify without the real
+  receiver in front of it:
+  1. Releases the app's own hook switch and opens every candidate GPIO
+     pin (`main.py`'s `HOOK_SCAN_CANDIDATE_PINS` -- general-purpose pins
+     only, excluding I2C/UART/EEPROM-ID pins even though this project
+     doesn't use them, since scanning those risks interfering with
+     something else on the board) so their live raw states can be shown
+     side by side (`ui/renderer.py`'s `render_hook_scan`).
+  2. Attendant lifts/hangs up the receiver while watching the grid and
+     taps whichever pin's dot actually responds.
+  3. Attendant lifts the receiver, holds it up, and taps Confirm -- this
+     one physical-position confirmation is what determines normally-open
+     vs normally-closed, replacing any timing heuristic entirely.
+  4. Apply saves both fields and reconnects the hook switch live, no
+     restart needed; Cancel at any point restores the original pin
+     untouched.
+  - A pin gpiozero can't claim is shown as "unavailable" rather than
+    aborting the whole scan; if gpiozero itself isn't installed, or every
+    candidate pin fails to claim, the wizard shows a clear error instead
+    of a blank/broken grid.
+- Added `tests/unit/test_hook_switch.py` invert coverage,
+  `test_config.py` coverage for the new field/editable keys, and a full
+  `test_main.py` suite for the wizard's state machine (start/select/
+  confirm/retry/apply/cancel, teardown on leaving DEVELOPER mid-scan,
+  render/touch dispatch) using a fake gpiozero `Button` shared between
+  `main.py` and `hardware/hook_switch.py`'s references to it. 380 tests
+  pass.
+- **Still not verified on the actual switch** -- this fixes what could be
+  fixed without seeing the real symptom (pin/polarity mismatch is by far
+  the most common cause of "switch doesn't work" reports), but if the
+  wizard finds no responding pin at all, that points at wiring/hardware,
+  not something the software can resolve.
+
 ## Unreleased — Guest-screen visual refresh + attendant Settings/Developer screens
 
 Implements the Claude Design handoff (`9 Developer.dc.html`, `1 Welcome.dc.html`,

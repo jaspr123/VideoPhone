@@ -27,14 +27,20 @@ EXTENDED_MAX_RECORDING_SECONDS = 300
 
 # Fields the attendant SETTINGS screen is allowed to persist back to the
 # config file (see BoothConfig.save_settings) -- everything else in
-# booth.default.json (camera/audio devices, GPIO pin, theme, hook switch,
-# etc.) is attendant-invisible and passes through a save untouched.
+# booth.default.json (camera/audio devices, theme, etc.) is
+# attendant-invisible and passes through a save untouched.
+# hook_switch_gpio_pin/hook_switch_invert are not exposed on the SETTINGS
+# screen itself -- they're written only by the DEVELOPER screen's "Find
+# receiver switch" wizard (see main.py's _apply_hook_scan_result), reusing
+# this same validated/atomic save path rather than a separate one.
 EDITABLE_SETTINGS_KEYS = (
     "max_recording_seconds",
     "countdown_seconds",
     "recording_mode",
     "live_mic_meter_enabled",
     "extended_mode",
+    "hook_switch_gpio_pin",
+    "hook_switch_invert",
 )
 
 REQUIRED_KEYS = (
@@ -100,6 +106,14 @@ class BoothConfig:
     # regardless of this setting (architecture rule 11).
     hook_switch_enabled: bool = True
     hook_switch_gpio_pin: int = 17
+    # Whether the switch's electrical logic is inverted relative to the
+    # spec's assumed normally-open wiring (stable LOW = lifted under the
+    # internal pull-up). A normally-closed switch wired the same
+    # (GND-only, per the spec's caution) reads the opposite way -- stable
+    # HIGH = lifted. False (default) assumes normally-open, matching
+    # PROJECT_SPEC.md section 4. Set by the DEVELOPER screen's "Find
+    # receiver switch" wizard (see main.py), not hand-edited in practice.
+    hook_switch_invert: bool = False
     # Only matters when record_input_format == "mjpeg" (a camera with no
     # onboard H.264 -- see media/ffmpeg.py). "quality" (default) records the
     # camera's raw MJPEG live (near-zero CPU, no audio-dropout risk) and
@@ -245,6 +259,10 @@ class BoothConfig:
                 f"got {hook_switch_gpio_pin!r}"
             )
 
+        hook_switch_invert = data.get("hook_switch_invert", False)
+        if not isinstance(hook_switch_invert, bool):
+            raise ConfigError(f"hook_switch_invert must be a boolean, got {hook_switch_invert!r}")
+
         recording_mode = str(data.get("recording_mode", "quality")).strip().lower()
         if recording_mode not in _VALID_RECORDING_MODES:
             raise ConfigError(
@@ -294,6 +312,7 @@ class BoothConfig:
             av_sync_offset_ms=av_sync_offset_ms,
             hook_switch_enabled=hook_switch_enabled,
             hook_switch_gpio_pin=hook_switch_gpio_pin,
+            hook_switch_invert=hook_switch_invert,
             recording_mode=recording_mode,
             theme_dir=(base_dir / theme_dir).resolve(),
             audio_playback_device=audio_playback_device,

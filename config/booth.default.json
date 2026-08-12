@@ -16,6 +16,7 @@
   "av_sync_offset_ms": 0,
   "hook_switch_enabled": true,
   "hook_switch_gpio_pin": 17,
+  "hook_switch_invert": false,
   "recording_mode": "quality",
   "theme_dir": "themes/classic-walnut",
   "live_mic_meter_enabled": false,

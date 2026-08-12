@@ -40,7 +40,7 @@ from video_guestbook.config import (
     BoothConfig,
     ConfigError,
 )
-from video_guestbook.hardware.hook_switch import HookSwitch, HookSwitchError
+from video_guestbook.hardware.hook_switch import Button, HookSwitch, HookSwitchError
 from video_guestbook.logging_setup import get_session_adapter, setup_logging
 from video_guestbook.media.audio_levels import (
     STATUS_READY,
@@ -110,6 +110,17 @@ ADMIN_LONG_PRESS_SECONDS = 1.6
 # DEVELOPER screen. Not measured on this project's actual hardware/event
 # footage -- a guess to replace with a real figure once there's data.
 _ESTIMATED_BYTES_PER_MESSAGE = 50 * 1024 * 1024
+
+# BCM GPIO pins the DEVELOPER "Find receiver switch" wizard (see
+# _start_hook_scan) tries when the configured pin isn't the right one.
+# Deliberately excludes 0/1 (EEPROM ID, not safe general-purpose), 2/3
+# (I2C SDA/SCL) and 14/15 (UART TX/RX) -- all commonly reserved even when
+# unused by this project, so scanning them risks interfering with
+# something else rather than finding the switch. GPIO27 (the spec's
+# documented diagnostic pin, PROJECT_SPEC.md section 4) is included like
+# any other candidate; the currently configured pin is always tried
+# first regardless of this list's order (see _start_hook_scan).
+HOOK_SCAN_CANDIDATE_PINS = (4, 5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27)
 
 
 def _point_in_rect(x: int, y: int, rect: tuple[int, int, int, int]) -> bool:
@@ -291,6 +302,12 @@ class BoothApp:
         # None whenever no corner-press is currently in progress.
         self._admin_press_started_at: float | None = None
 
+        # DEVELOPER's "Find receiver switch" wizard state (see
+        # _start_hook_scan/_hook_scan_view). None whenever the wizard
+        # isn't open -- render()/DEVELOPER falls back to the normal
+        # render_developer screen in that case.
+        self._hook_scan: dict | None = None
+
     def open_hook_switch(self) -> None:
         """Best-effort: missing/failed GPIO must not crash the app (rule 17).
 
@@ -301,10 +318,14 @@ class BoothApp:
             return
         try:
             self.hook_switch = HookSwitch(
-                pin=self.config.hook_switch_gpio_pin, logger=self.logger
+                pin=self.config.hook_switch_gpio_pin,
+                invert=self.config.hook_switch_invert,
+                logger=self.logger,
             )
             self.logger.info(
-                "hook switch initialized on GPIO%d", self.config.hook_switch_gpio_pin
+                "hook switch initialized on GPIO%d (invert=%s)",
+                self.config.hook_switch_gpio_pin,
+                self.config.hook_switch_invert,
             )
         except HookSwitchError as exc:
             self.logger.warning(
@@ -668,6 +689,9 @@ class BoothApp:
         self._start_mic_check(context="developer")
 
     def _leave_developer_to_settings(self) -> None:
+        if self._hook_scan is not None:
+            self._teardown_hook_scan()
+            self.open_hook_switch()
         self._stop_mic_check()
         self._enter_state(BoothState.SETTINGS)
 
@@ -718,12 +742,174 @@ class BoothApp:
     def _apply_developer_action(self, name: str) -> None:
         if name == "back":
             self._leave_developer_to_settings()
+        elif name == "find_switch":
+            self._start_hook_scan()
         elif name in ("export_logs", "restart_booth"):
             # Neither has a real implementation yet (no log bundling, no
             # process supervisor to restart under) -- log the tap so it's
             # visible during a real admin session rather than doing
             # nothing silently.
             self.logger.info("Developer: %r tapped -- not implemented yet, ignoring", name)
+
+    # ── DEVELOPER: "Find receiver switch" live-monitor wizard ─────────
+    #
+    # Built because wiring/polarity mixups are common enough on real
+    # installs to be worth a guided tool rather than trial-and-error edits
+    # to booth.default.json (see hardware/hook_switch.py's module
+    # docstring on normally-open vs normally-closed switches). Rather
+    # than have software silently guess a pin/polarity from timing
+    # windows it can't verify without the real receiver, this shows every
+    # candidate pin's live state so the attendant -- physically lifting
+    # and hanging up the receiver -- can see which one moves and confirm
+    # it directly. Two attendant confirmations (which pin, which state is
+    # "lifted") replace any timing heuristics entirely.
+
+    def _start_hook_scan(self) -> None:
+        """Enter the wizard: release the app's own hook switch (gpiozero
+        can't share a GPIO pin between two Button objects) and open a
+        fresh one on every candidate pin so their live states can be
+        shown side by side. A pin gpiozero can't claim (already in use,
+        invalid on this board) is marked unavailable rather than aborting
+        the whole scan (rule 17)."""
+        if Button is None:
+            self._hook_scan = {"phase": "error", "error": "gpiozero is not installed on this device"}
+            return
+
+        if self.hook_switch is not None:
+            self.hook_switch.close()
+            self.hook_switch = None
+
+        configured_pin = self.config.hook_switch_gpio_pin
+        ordered_pins = [configured_pin] + [p for p in HOOK_SCAN_CANDIDATE_PINS if p != configured_pin]
+
+        buttons: dict[int, object | None] = {}
+        for pin in ordered_pins:
+            try:
+                buttons[pin] = Button(pin, pull_up=True)
+            except Exception as exc:
+                self.logger.debug("hook scan: could not claim GPIO%d: %s", pin, exc)
+                buttons[pin] = None
+
+        if all(b is None for b in buttons.values()):
+            self._hook_scan = {
+                "phase": "error",
+                "error": "Could not claim any GPIO pin -- check nothing else on the Pi is using them",
+            }
+            return
+
+        self._hook_scan = {
+            "phase": "monitor",
+            "pins": ordered_pins,
+            "configured_pin": configured_pin,
+            "buttons": buttons,
+            "selected_pin": None,
+            "invert": None,
+            "error": None,
+        }
+        self.logger.info("hook scan: started, candidates=%s", ordered_pins)
+
+    def _select_hook_scan_pin(self, pin: int) -> None:
+        scan = self._hook_scan
+        if scan is None or scan["phase"] != "monitor":
+            return
+        if scan["buttons"].get(pin) is None:
+            return  # unavailable pin, not selectable
+        scan["selected_pin"] = pin
+        scan["phase"] = "confirm"
+
+    def _confirm_hook_scan_polarity(self) -> None:
+        """Attendant was asked to lift the receiver and hold it up, then
+        tap Confirm -- whatever the selected pin reads *right now* is
+        defined as "lifted". HookSwitch's un-inverted convention is raw
+        is_pressed=True == lifted (see hardware/hook_switch.py), so
+        invert is set whenever that's not what we just observed."""
+        scan = self._hook_scan
+        if scan is None or scan["phase"] != "confirm" or scan["selected_pin"] is None:
+            return
+        button = scan["buttons"].get(scan["selected_pin"])
+        if button is None:
+            return
+        try:
+            raw_while_lifted = bool(button.is_pressed)
+        except Exception as exc:
+            self.logger.warning("hook scan: could not read selected pin: %s", exc)
+            return
+        scan["invert"] = not raw_while_lifted
+        scan["phase"] = "result"
+
+    def _retry_hook_scan(self) -> None:
+        scan = self._hook_scan
+        if scan is None:
+            return
+        scan["phase"] = "monitor"
+        scan["selected_pin"] = None
+        scan["invert"] = None
+
+    def _apply_hook_scan_result(self) -> None:
+        scan = self._hook_scan
+        if scan is None or scan["phase"] != "result" or scan["selected_pin"] is None:
+            return
+        pin, invert = scan["selected_pin"], bool(scan["invert"])
+        self._teardown_hook_scan()
+        self._save_settings({"hook_switch_gpio_pin": pin, "hook_switch_invert": invert})
+        self.open_hook_switch()
+
+    def _cancel_hook_scan(self) -> None:
+        self._teardown_hook_scan()
+        self.open_hook_switch()  # restore on the still-configured pin
+
+    def _teardown_hook_scan(self) -> None:
+        scan = self._hook_scan
+        self._hook_scan = None
+        if scan is None:
+            return
+        for button in scan.get("buttons", {}).values():
+            if button is not None:
+                try:
+                    button.close()
+                except Exception:
+                    self.logger.exception("hook scan: error closing a candidate GPIO pin")
+
+    def _apply_hook_scan_action(self, name: str) -> None:
+        if name == "cancel":
+            self._cancel_hook_scan()
+        elif name == "confirm":
+            self._confirm_hook_scan_polarity()
+        elif name == "retry":
+            self._retry_hook_scan()
+        elif name == "apply":
+            self._apply_hook_scan_result()
+        elif name.startswith("pin_"):
+            self._select_hook_scan_pin(int(name.removeprefix("pin_")))
+
+    def _hook_scan_view(self) -> dict:
+        """Plain-data snapshot of _hook_scan for the renderer -- keeps
+        ui/renderer.py decoupled from gpiozero Button objects."""
+        scan = self._hook_scan
+        if scan is None:
+            return {"phase": "error", "error": "no scan in progress"}
+        if scan["phase"] == "error":
+            return {"phase": "error", "error": scan.get("error", "")}
+
+        pin_states: dict[int, bool | None] = {}
+        for pin in scan["pins"]:
+            button = scan["buttons"].get(pin)
+            if button is None:
+                pin_states[pin] = None
+                continue
+            try:
+                pin_states[pin] = bool(button.is_pressed)
+            except Exception:
+                pin_states[pin] = None
+
+        return {
+            "phase": scan["phase"],
+            "pins": scan["pins"],
+            "pin_states": pin_states,
+            "selected_pin": scan["selected_pin"],
+            "invert": scan["invert"],
+            "configured_pin": scan["configured_pin"],
+        }
 
     def _developer_snapshot(self) -> dict:
         """Best-effort hardware/process telemetry for the DEVELOPER screen
@@ -838,10 +1024,16 @@ class BoothApp:
                     self._apply_settings_action(name)
                     break
         elif state == BoothState.DEVELOPER:
-            for name, rect in self.renderer.developer_rects.items():
-                if _point_in_rect(x, y, rect):
-                    self._apply_developer_action(name)
-                    break
+            if self._hook_scan is not None:
+                for name, rect in self.renderer.hook_scan_rects.items():
+                    if _point_in_rect(x, y, rect):
+                        self._apply_hook_scan_action(name)
+                        break
+            else:
+                for name, rect in self.renderer.developer_rects.items():
+                    if _point_in_rect(x, y, rect):
+                        self._apply_developer_action(name)
+                        break
 
     def _handle_mouse_up(self, x: int, y: int) -> None:
         if self._admin_press_started_at is None:
@@ -959,6 +1151,8 @@ class BoothApp:
                 theme_name=self.theme.name,
             )
         elif state == BoothState.DEVELOPER:
+            if self._hook_scan is not None:
+                return self.renderer.render_hook_scan(now, self._hook_scan_view())
             return self.renderer.render_developer(now, **self._developer_snapshot())
 
         return self.renderer.render_ready(now)
@@ -1007,6 +1201,8 @@ class BoothApp:
                     running = self.handle_key(key)
         finally:
             self._stop_mic_check()
+            if self._hook_scan is not None:
+                self._teardown_hook_scan()
             if self.recorder.is_running:
                 try:
                     self.recorder.stop()

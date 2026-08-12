@@ -97,6 +97,7 @@ class Renderer:
         # this layout math (same pattern as record_button_rect above).
         self.settings_rects: dict[str, tuple[int, int, int, int]] = {}
         self.developer_rects: dict[str, tuple[int, int, int, int]] = {}
+        self.hook_scan_rects: dict[str, tuple[int, int, int, int]] = {}
 
         # Per-screen static chrome, rendered once and reused. Key is the
         # screen name plus any value baked into it (e.g. the ERROR reason
@@ -1383,6 +1384,10 @@ class Renderer:
         rec_x = mic_x + mic_w + self.w * (28 / 1024)
         rec_w = self.w * (240 / 1024)
         self._draw_tracked_left(draw, rec_x, row_y, "RECEIVER", label_font, gold_dark, spacing=3)
+        find_w, find_h = self.w * (128 / 1024), self.h * (26 / 576)
+        find_x1, find_y0 = rec_x + rec_w, row_y - find_h * 0.68
+        self._admin_pill_button(draw, find_x1 - find_w, find_y0, find_x1, find_y0 + find_h, "Find switch")
+        self.developer_rects["find_switch"] = (int(find_x1 - find_w), int(find_y0), int(find_x1), int(find_y0 + find_h))
         card_y0 = row_y + self.h * (26 / 576)
         card_h = self.h * (139 / 576)
         hook_color = self._ADMIN_GOOD if hook_off_hook else self._ADMIN_GOLD_DARK
@@ -1476,6 +1481,137 @@ class Renderer:
         by += btn_h + gap
         self._admin_pill_button(draw, btn_x1 - btn_w, by, btn_x1, by + btn_h, "Restart booth", danger=True)
         self.developer_rects["restart_booth"] = (int(btn_x1 - btn_w), int(by), int(btn_x1), int(by + btn_h))
+
+        return self._to_bgr(canvas)
+
+    def _hook_scan_button(
+        self,
+        draw: ImageDraw.ImageDraw,
+        key: str,
+        label: str,
+        cx: float,
+        cy: float,
+        w: float | None = None,
+        h: float | None = None,
+        filled: bool = False,
+        danger: bool = False,
+    ) -> None:
+        w = w if w is not None else self.w * 0.2
+        h = h if h is not None else self.h * (48 / 576)
+        x0, y0 = cx - w / 2, cy - h / 2
+        self._admin_pill_button(draw, x0, y0, x0 + w, y0 + h, label, filled=filled, danger=danger)
+        self.hook_scan_rects[key] = (int(x0), int(y0), int(x0 + w), int(y0 + h))
+
+    def _draw_hook_pin_grid(self, draw: ImageDraw.ImageDraw, scan: dict, selectable: bool) -> None:
+        """Live grid of every candidate GPIO pin's raw state (green =
+        pulled low / "active", dark gold = idle high, grey = gpiozero
+        couldn't claim it) -- the attendant watches this while physically
+        lifting/hanging up the receiver and taps whichever pin visibly
+        responds. The currently configured pin gets a gold outline so
+        it's easy to spot at a glance."""
+        pins = scan["pins"]
+        pin_states = scan["pin_states"]
+        configured_pin = scan.get("configured_pin")
+        cols = 5
+        gap = self.w * (16 / 1024)
+        grid_x0 = self.w * (36 / 1024)
+        grid_w = self.w * (952 / 1024)
+        col_w = (grid_w - gap * (cols - 1)) / cols
+        row_h = self.h * (68 / 576)
+        row_gap = self.h * (14 / 576)
+        grid_y0 = self.h * (150 / 576)
+        label_font = self._font("heading_medium", int(self.h * (14 / 576)))
+        na_font = self._font("heading_medium", int(self.h * (12 / 576)))
+        ink = _rgba(self._ADMIN_INK)
+
+        for i, pin in enumerate(pins):
+            col, row = i % cols, i // cols
+            x0 = grid_x0 + col * (col_w + gap)
+            y0 = grid_y0 + row * (row_h + row_gap)
+            cx = x0 + col_w / 2
+            state = pin_states.get(pin)
+            is_configured = pin == configured_pin
+            outline_color = _rgba(self._ADMIN_GOLD) if is_configured else _rgba(self._ADMIN_GOLD, 70)
+            draw.rounded_rectangle(
+                [x0, y0, x0 + col_w, y0 + row_h], radius=int(self.h * 0.014),
+                outline=outline_color, width=2 if is_configured else 1,
+            )
+            if state is None:
+                draw.text((cx, y0 + row_h * 0.42), "unavailable", font=na_font, fill=(*self._ADMIN_INK, 120), anchor="mm")
+            else:
+                dot_color = self._ADMIN_GOOD if state else self._ADMIN_GOLD_DARK
+                dot_r = self.h * 0.022
+                dot_cy = y0 + row_h * 0.4
+                draw.ellipse([cx - dot_r, dot_cy - dot_r, cx + dot_r, dot_cy + dot_r], fill=_rgba(dot_color))
+                if selectable:
+                    self.hook_scan_rects[f"pin_{pin}"] = (int(x0), int(y0), int(x0 + col_w), int(y0 + row_h))
+            draw.text((cx, y0 + row_h * 0.78), f"GPIO {pin}", font=label_font, fill=ink, anchor="mm")
+
+    def render_hook_scan(self, now: float, scan: dict) -> np.ndarray:
+        """DEVELOPER's "Find receiver switch" wizard (see main.py's
+        _start_hook_scan and friends). Deliberately not a fully-automatic
+        pin/polarity guesser -- it shows every candidate pin's live state
+        side by side so the attendant, physically operating the receiver,
+        can see and confirm which one responds, rather than the app
+        inferring a timing window it has no way to verify without the
+        real hardware in front of it.
+        """
+        canvas, draw = self._admin_canvas()
+        ink = _rgba(self._ADMIN_INK)
+        cx = self.w / 2
+        self.hook_scan_rects = {}
+
+        title_font = self._font("script", int(self.h * (40 / 576)))
+        draw.text((cx, self.h * (40 / 576)), "Find Receiver Switch", font=title_font, fill=ink, anchor="ma")
+
+        phase = scan.get("phase", "error")
+        instr_font = self._font("heading_medium", int(self.h * (18 / 576)))
+        dim_ink = self._blend_full(self._ADMIN_BG, self._ADMIN_INK, 180)
+
+        if phase == "error":
+            draw.text(
+                (cx, self.h * (220 / 576)), scan.get("error") or "Something went wrong",
+                font=instr_font, fill=_rgba(self._ADMIN_RED), anchor="ma",
+            )
+            self._hook_scan_button(draw, "cancel", "Back", cx, self.h * 0.85)
+
+        elif phase == "monitor":
+            draw.text((cx, self.h * (92 / 576)), "Lift and hang up the receiver a few times.", font=instr_font, fill=ink, anchor="ma")
+            draw.text((cx, self.h * (116 / 576)), "Then tap the pin whose dot changes.", font=instr_font, fill=dim_ink, anchor="ma")
+            self._draw_hook_pin_grid(draw, scan, selectable=True)
+            self._hook_scan_button(draw, "cancel", "Cancel", cx, self.h * 0.9)
+
+        elif phase == "confirm":
+            pin = scan["selected_pin"]
+            draw.text((cx, self.h * (100 / 576)), f"Selected GPIO {pin}.", font=instr_font, fill=ink, anchor="ma")
+            draw.text((cx, self.h * (128 / 576)), "Lift the receiver and hold it up, then tap Confirm.", font=instr_font, fill=dim_ink, anchor="ma")
+            state = scan["pin_states"].get(pin)
+            dot_color = self._ADMIN_GOOD if state else self._ADMIN_GOLD_DARK
+            dot_r = self.h * 0.045
+            dot_cy = self.h * (230 / 576)
+            draw.ellipse(
+                [cx - dot_r, dot_cy - dot_r, cx + dot_r, dot_cy + dot_r],
+                outline=_rgba(self._ADMIN_GOLD_DARK), width=3, fill=_rgba(dot_color),
+            )
+            row_y = self.h * 0.85
+            btn_w = self.w * 0.18
+            gap = self.w * 0.01
+            self._hook_scan_button(draw, "retry", "Back", cx - btn_w / 2 - gap, row_y, w=btn_w)
+            self._hook_scan_button(draw, "confirm", "Confirm", cx + btn_w / 2 + gap, row_y, w=btn_w, filled=True)
+
+        elif phase == "result":
+            pin = scan["selected_pin"]
+            invert = scan["invert"]
+            result_font = self._font("heading", int(self.h * (28 / 576)))
+            draw.text((cx, self.h * (150 / 576)), f"Found on GPIO {pin}", font=result_font, fill=_rgba(self._ADMIN_GOOD), anchor="ma")
+            wiring = "Inverted (normally-closed) wiring" if invert else "Normal (normally-open) wiring"
+            draw.text((cx, self.h * (192 / 576)), wiring, font=instr_font, fill=dim_ink, anchor="ma")
+            row_y = self.h * 0.82
+            btn_w = self.w * 0.18
+            gap = self.w * 0.014
+            self._hook_scan_button(draw, "retry", "Try again", cx - btn_w - gap, row_y, w=btn_w)
+            self._hook_scan_button(draw, "cancel", "Cancel", cx, row_y, w=btn_w)
+            self._hook_scan_button(draw, "apply", "Apply", cx + btn_w + gap, row_y, w=btn_w, filled=True)
 
         return self._to_bgr(canvas)
 

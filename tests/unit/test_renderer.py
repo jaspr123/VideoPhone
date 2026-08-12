@@ -268,7 +268,7 @@ def test_render_developer_with_camera_frame(renderer, shape):
 
 def test_render_developer_populates_control_rects(renderer):
     renderer.render_developer(time.monotonic(), **_developer_kwargs())
-    assert set(renderer.developer_rects) == {"back", "export_logs", "restart_booth"}
+    assert set(renderer.developer_rects) == {"back", "export_logs", "restart_booth", "find_switch"}
     for rect in renderer.developer_rects.values():
         x0, y0, x1, y1 = rect
         assert 0 <= x0 < x1 <= 1024
@@ -291,3 +291,75 @@ def test_render_developer_off_hook_and_clipping(renderer):
             **_developer_kwargs(hook_off_hook=True, hook_pin_state="LOW", hook_held_seconds=4.2, peak_db=-0.5, clip_count=3, last_error="camera read failed"),
         )
     )
+
+
+# ── "Find receiver switch" wizard ────────────────────────────────────
+
+_SCAN_PINS = [17, 27, 4, 5]
+
+
+def test_render_hook_scan_monitor_phase(renderer):
+    scan = {
+        "phase": "monitor",
+        "pins": _SCAN_PINS,
+        "pin_states": {17: False, 27: False, 4: True, 5: None},
+        "selected_pin": None,
+        "invert": None,
+        "configured_pin": 17,
+    }
+    _assert_frame(renderer.render_hook_scan(time.monotonic(), scan))
+    assert "pin_17" in renderer.hook_scan_rects
+    assert "pin_4" in renderer.hook_scan_rects
+    assert "pin_5" not in renderer.hook_scan_rects  # unavailable, not selectable
+    assert "cancel" in renderer.hook_scan_rects
+
+
+def test_render_hook_scan_confirm_phase(renderer):
+    scan = {
+        "phase": "confirm",
+        "pins": _SCAN_PINS,
+        "pin_states": {17: False, 27: False, 4: True, 5: None},
+        "selected_pin": 4,
+        "invert": None,
+        "configured_pin": 17,
+    }
+    _assert_frame(renderer.render_hook_scan(time.monotonic(), scan))
+    assert set(renderer.hook_scan_rects) == {"retry", "confirm"}
+
+
+def test_render_hook_scan_result_phase(renderer):
+    scan = {
+        "phase": "result",
+        "pins": _SCAN_PINS,
+        "pin_states": {17: False, 27: False, 4: True, 5: None},
+        "selected_pin": 4,
+        "invert": True,
+        "configured_pin": 17,
+    }
+    _assert_frame(renderer.render_hook_scan(time.monotonic(), scan))
+    assert set(renderer.hook_scan_rects) == {"retry", "cancel", "apply"}
+
+
+def test_render_hook_scan_error_phase(renderer):
+    scan = {"phase": "error", "error": "gpiozero is not installed on this device"}
+    _assert_frame(renderer.render_hook_scan(time.monotonic(), scan))
+    assert set(renderer.hook_scan_rects) == {"cancel"}
+
+
+def test_render_hook_scan_rects_within_bounds(renderer):
+    # Matches main.py's HOOK_SCAN_CANDIDATE_PINS count (17) -- the actual
+    # number the app ever passes in production.
+    pins = [4, 5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    scan = {
+        "phase": "monitor",
+        "pins": pins,
+        "pin_states": {p: (p % 2 == 0) for p in pins},
+        "selected_pin": None,
+        "invert": None,
+        "configured_pin": 17,
+    }
+    renderer.render_hook_scan(time.monotonic(), scan)
+    for rect in renderer.hook_scan_rects.values():
+        x0, y0, x1, y1 = rect
+        assert 0 <= x0 < x1 <= 1024
+        assert 0 <= y0 < y1 <= 576

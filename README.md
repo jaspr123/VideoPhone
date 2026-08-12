@@ -195,6 +195,7 @@ Key fields:
 | `av_sync_offset_ms`      | Manual A/V sync correction, in milliseconds. `0` = no correction (default). See "Fixing audio/video sync" below. |
 | `hook_switch_enabled`    | `true` (default) to use the physical receiver switch; `false` for Spacebar-only |
 | `hook_switch_gpio_pin`   | BCM GPIO pin number for the primary hook-switch signal (default `17`, per PROJECT_SPEC.md section 4) |
+| `hook_switch_invert`     | `false` (default) assumes a normally-open switch (lifted = stable LOW). `true` for a normally-closed switch wired the same GND-only way, which reads the opposite. Usually set by the DEVELOPER screen's "Find receiver switch" wizard, not by hand -- see "Hook switch" below. |
 | `recording_mode`         | `quality` (default, deferred background transcode, no audio-dropout risk) or `fast` (live transcode, immediately final). Only matters when `record_input_format` is `mjpeg`. See "Recording modes" below. |
 | `theme_dir`              | Path to a theme directory (default `themes/classic-walnut`), relative to the repository root. See "Themed guest UI" below. |
 | `audio_playback_device`  | ALSA *playback* device for prompt sounds (e.g. the pickup greeting), e.g. `plughw:CARD=Device,DEV=0`. `null`/omitted uses the system default output. Separate from `audio_device` (the microphone). |
@@ -593,6 +594,41 @@ tool.
 the configured GPIO pin can be claimed, but that only proves the software
 side is ready -- it does **not** simulate lifting the receiver. Confirm the
 real thing works by running the app and physically lifting/hanging up.
+
+### If the switch doesn't respond: "Find receiver switch" wizard
+
+If lifting/hanging up the physical receiver does nothing (and the
+DEVELOPER screen's Receiver card never changes either), the most common
+causes are the switch being wired to a different GPIO pin than
+`hook_switch_gpio_pin` is set to, or the switch being normally-closed
+rather than normally-open (which reads the opposite of what
+`hook_switch_invert: false`'s default assumes -- see the config table
+above). Rather than editing `booth.default.json` by trial and error:
+
+1. Long-press the bottom-right corner of the Welcome screen (~1.6s) to
+   open Settings, then tap **Developer**.
+2. Tap **Find switch** next to the Receiver card.
+3. Lift and hang up the receiver a few times while watching the grid of
+   candidate pins -- the one actually wired to the switch is the one
+   whose dot changes. Tap that pin.
+4. Lift the receiver and hold it up, then tap **Confirm**. This is what
+   determines normally-open vs normally-closed -- the wizard doesn't
+   guess it from timing, it asks you to hold a known position and reads
+   whichever pin you selected.
+5. Tap **Apply** to save `hook_switch_gpio_pin`/`hook_switch_invert` and
+   reconnect the hook switch live, no restart needed. **Cancel** at any
+   point leaves the config untouched and reconnects on the pin you
+   started with.
+
+If no pin's dot ever changes, that rules out a software misconfiguration
+entirely -- the problem is upstream (wiring, a broken switch, or a wire
+that's come loose), not something this wizard can fix.
+
+The candidate pins it tries (`main.py`'s `HOOK_SCAN_CANDIDATE_PINS`) are
+general-purpose GPIOs, deliberately excluding ones commonly reserved for
+other things (I2C, UART, the EEPROM ID pins) even when this project isn't
+using them -- scanning those risks interfering with something else on the
+board rather than finding the switch.
 
 ## Logs
 

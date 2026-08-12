@@ -7,8 +7,20 @@ Wiring (as documented in the spec):
 
 GPIO17 is the primary, production receiver-state signal, using the GPIO's
 internal pull-up resistor (never wire the switch to 5V or 3.3V):
-    stable LOW  -> receiver lifted (off-hook)
+    stable LOW  -> receiver lifted (off-hook)   [normally-open switch]
     stable HIGH -> receiver on-hook
+
+That LOW=lifted mapping assumes a normally-open switch (circuit closes,
+pulling the pin to GND, when the receiver is lifted). A normally-closed
+switch wired the same GND-only way reads the opposite: stable HIGH when
+lifted. `invert` (see HookSwitch.__init__) flips is_lifted's
+interpretation for that case -- it does not change the wiring rule itself,
+never wire either terminal to 5V/3.3V regardless of switch type. Which
+one you have, and which GPIO pin it's actually on, is exactly what the
+attendant DEVELOPER screen's "Find receiver switch" wizard (main.py's
+_start_hook_scan and friends) is for -- confirmed miswiring/wrong-pin
+issues on real installs are common enough that this is expected to run at
+least once per physical booth setup.
 
 GPIO27 was observed to stay low regardless of hook state during initial
 testing and is treated as diagnostic-only, not used for production
@@ -57,12 +69,17 @@ class HookSwitch:
         poll_debounce_seconds: float = POLL_DEBOUNCE_SECONDS,
         logger: logging.Logger | None = None,
         pin_factory=None,
+        invert: bool = False,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
         self._poll_debounce_seconds = poll_debounce_seconds
         self._confirmed_lifted: bool | None = None
         self._pending_lifted: bool | None = None
         self._pending_since: float | None = None
+        # See module docstring: False assumes a normally-open switch
+        # (raw LOW/is_pressed=True == lifted); True flips that for a
+        # normally-closed one, wired the same GND-only way.
+        self._invert = invert
 
         if Button is None:
             raise HookSwitchError(
@@ -93,16 +110,19 @@ class HookSwitch:
 
     @property
     def is_lifted(self) -> bool:
-        """Raw, instantaneous GPIO17 read (no debounce) -- for diagnostics.
+        """Raw, instantaneous read (no debounce) -- for diagnostics.
 
         Callers doing edge detection (start/stop on lift/hang-up) should
         use poll() instead: a single raw read taken at a fast, tight
         polling rate can catch mechanical switch bounce mid-transition.
+        Already accounts for `invert` -- True always means "lifted",
+        regardless of the switch's electrical polarity.
         """
         try:
-            return bool(self._button.is_pressed)
+            raw = bool(self._button.is_pressed)
         except Exception as exc:
             raise HookSwitchError(f"could not read hook switch state: {exc}") from exc
+        return (not raw) if self._invert else raw
 
     def poll(self, now: float) -> bool:
         """Debounced hook state, safe to call every frame at any poll rate.

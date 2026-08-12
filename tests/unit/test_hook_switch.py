@@ -77,6 +77,22 @@ def test_is_lifted_reflects_primary_button_pressed(button_registry):
     assert switch.is_lifted is False
 
 
+def test_is_lifted_respects_invert(button_registry):
+    switch = HookSwitch(pin=17, diagnostic_pin=None, invert=True)
+
+    button_registry[17].is_pressed = True
+    assert switch.is_lifted is False  # inverted: raw True == on-hook
+
+    button_registry[17].is_pressed = False
+    assert switch.is_lifted is True  # inverted: raw False == lifted
+
+
+def test_is_lifted_default_not_inverted(button_registry):
+    switch = HookSwitch(pin=17, diagnostic_pin=None)
+    button_registry[17].is_pressed = True
+    assert switch.is_lifted is True
+
+
 def test_is_lifted_wraps_read_errors(monkeypatch):
     monkeypatch.setattr(hook_switch_module, "Button", RaisingReadButton)
     switch = HookSwitch(pin=17, diagnostic_pin=None)

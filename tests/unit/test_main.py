@@ -657,3 +657,268 @@ def test_developer_snapshot_reflects_last_result_reason(tmp_path):
     app = _app(tmp_path)
     app._last_result_reason = "camera read failed"
     assert app._developer_snapshot()["last_error"] == "camera read failed"
+
+
+# ── "Find receiver switch" wizard ────────────────────────────────────
+
+from video_guestbook.hardware import hook_switch as hook_switch_module  # noqa: E402
+
+
+class _FakeGpioButton:
+    def __init__(self, pin, pull_up=None, bounce_time=None, pin_factory=None):
+        self.pin = pin
+        self.is_pressed = False
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_gpio(monkeypatch):
+    """Patches gpiozero's Button everywhere it's referenced -- main.py's
+    own `Button` name (used directly by the scan wizard) and
+    hardware/hook_switch.py's (used internally by HookSwitch, which
+    main.py's open_hook_switch() constructs) -- sharing one registry so
+    a test can drive both through the same fake pins. A pin listed in
+    `unavailable` raises on construction, simulating gpiozero refusing to
+    claim it (already in use, invalid on this board, etc).
+    """
+    created: dict[int, _FakeGpioButton] = {}
+    unavailable: set[int] = set()
+
+    def factory(pin, **kwargs):
+        if pin in unavailable:
+            raise RuntimeError(f"pin {pin} busy")
+        button = _FakeGpioButton(pin, **kwargs)
+        created[pin] = button
+        return button
+
+    monkeypatch.setattr(main_module, "Button", factory)
+    monkeypatch.setattr(hook_switch_module, "Button", factory)
+    return created, unavailable
+
+
+def test_start_hook_scan_opens_all_candidates_and_closes_existing_switch(tmp_path, fake_gpio):
+    created, _ = fake_gpio
+    app = _app(tmp_path)
+    app.open_hook_switch()
+    original_switch = app.hook_switch
+    assert original_switch is not None
+
+    app._start_hook_scan()
+
+    assert app.hook_switch is None  # released so candidate pins can be opened
+    assert original_switch._button.closed is True
+    assert app._hook_scan["phase"] == "monitor"
+    assert set(app._hook_scan["pins"]) == set(main_module.HOOK_SCAN_CANDIDATE_PINS)
+    assert app._hook_scan["pins"][0] == app.config.hook_switch_gpio_pin  # configured pin first
+    assert set(created) == set(main_module.HOOK_SCAN_CANDIDATE_PINS)
+
+
+def test_start_hook_scan_marks_unclaimable_pins_unavailable(tmp_path, fake_gpio):
+    _, unavailable = fake_gpio
+    unavailable.add(22)
+    app = _app(tmp_path)
+
+    app._start_hook_scan()
+
+    assert app._hook_scan["buttons"][22] is None
+    view = app._hook_scan_view()
+    assert view["pin_states"][22] is None
+
+
+def test_start_hook_scan_without_gpiozero_sets_error_phase(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "Button", None)
+    app = _app(tmp_path)
+
+    app._start_hook_scan()
+
+    assert app._hook_scan["phase"] == "error"
+    assert "gpiozero" in app._hook_scan["error"]
+
+
+def test_start_hook_scan_all_pins_unclaimable_sets_error_phase(tmp_path, monkeypatch):
+    def always_fails(pin, **kwargs):
+        raise RuntimeError("busy")
+
+    monkeypatch.setattr(main_module, "Button", always_fails)
+    app = _app(tmp_path)
+
+    app._start_hook_scan()
+
+    assert app._hook_scan["phase"] == "error"
+
+
+def test_select_hook_scan_pin_moves_to_confirm(tmp_path, fake_gpio):
+    app = _app(tmp_path)
+    app._start_hook_scan()
+
+    app._select_hook_scan_pin(22)
+
+    assert app._hook_scan["phase"] == "confirm"
+    assert app._hook_scan["selected_pin"] == 22
+
+
+def test_select_hook_scan_pin_ignores_unavailable(tmp_path, fake_gpio):
+    _, unavailable = fake_gpio
+    unavailable.add(22)
+    app = _app(tmp_path)
+    app._start_hook_scan()
+
+    app._select_hook_scan_pin(22)
+
+    assert app._hook_scan["phase"] == "monitor"
+    assert app._hook_scan["selected_pin"] is None
+
+
+def test_confirm_hook_scan_polarity_normal_wiring(tmp_path, fake_gpio):
+    created, _ = fake_gpio
+    app = _app(tmp_path)
+    app._start_hook_scan()
+    app._select_hook_scan_pin(22)
+    created[22].is_pressed = True  # "lifted" reads raw True -> not inverted
+
+    app._confirm_hook_scan_polarity()
+
+    assert app._hook_scan["phase"] == "result"
+    assert app._hook_scan["invert"] is False
+
+
+def test_confirm_hook_scan_polarity_inverted_wiring(tmp_path, fake_gpio):
+    created, _ = fake_gpio
+    app = _app(tmp_path)
+    app._start_hook_scan()
+    app._select_hook_scan_pin(22)
+    created[22].is_pressed = False  # "lifted" reads raw False -> inverted
+
+    app._confirm_hook_scan_polarity()
+
+    assert app._hook_scan["phase"] == "result"
+    assert app._hook_scan["invert"] is True
+
+
+def test_retry_hook_scan_resets_to_monitor(tmp_path, fake_gpio):
+    app = _app(tmp_path)
+    app._start_hook_scan()
+    app._select_hook_scan_pin(22)
+    app._confirm_hook_scan_polarity()
+
+    app._retry_hook_scan()
+
+    assert app._hook_scan["phase"] == "monitor"
+    assert app._hook_scan["selected_pin"] is None
+    assert app._hook_scan["invert"] is None
+
+
+def test_apply_hook_scan_result_saves_settings_and_reopens_switch(tmp_path, fake_gpio):
+    created, _ = fake_gpio
+    app = _app_with_config_file(tmp_path)
+    app._start_hook_scan()
+    app._select_hook_scan_pin(22)
+    created[22].is_pressed = True
+    app._confirm_hook_scan_polarity()
+
+    app._apply_hook_scan_result()
+
+    assert app._hook_scan is None
+    assert app.config.hook_switch_gpio_pin == 22
+    assert app.config.hook_switch_invert is False
+    assert app.hook_switch is not None  # reopened on the new pin
+    reloaded = json.loads(app.config_path.read_text(encoding="utf-8"))
+    assert reloaded["hook_switch_gpio_pin"] == 22
+
+
+def test_cancel_hook_scan_reopens_original_pin_without_saving(tmp_path, fake_gpio):
+    app = _app_with_config_file(tmp_path)
+    original_pin = app.config.hook_switch_gpio_pin
+    app._start_hook_scan()
+    app._select_hook_scan_pin(22)
+
+    app._cancel_hook_scan()
+
+    assert app._hook_scan is None
+    assert app.config.hook_switch_gpio_pin == original_pin  # unchanged
+    assert app.hook_switch is not None
+
+
+def test_apply_hook_scan_action_dispatches_pin_selection(tmp_path, fake_gpio):
+    app = _app(tmp_path)
+    app._start_hook_scan()
+
+    app._apply_hook_scan_action("pin_22")
+
+    assert app._hook_scan["selected_pin"] == 22
+
+
+@pytest.mark.parametrize(
+    "action,expected_phase",
+    [("cancel", None), ("confirm", "monitor")],  # confirm before selecting a pin is a no-op
+)
+def test_apply_hook_scan_action_cancel_and_noop_confirm(tmp_path, fake_gpio, action, expected_phase):
+    app = _app(tmp_path)
+    app._start_hook_scan()
+
+    app._apply_hook_scan_action(action)
+
+    if expected_phase is None:
+        assert app._hook_scan is None
+    else:
+        assert app._hook_scan["phase"] == expected_phase
+
+
+def test_developer_find_switch_button_starts_scan(tmp_path, fake_gpio):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app.state_machine.transition(BoothState.DEVELOPER)
+
+    app._apply_developer_action("find_switch")
+
+    assert app._hook_scan is not None
+    assert app._hook_scan["phase"] == "monitor"
+
+
+def test_leaving_developer_during_scan_tears_it_down(tmp_path, fake_gpio):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app.state_machine.transition(BoothState.DEVELOPER)
+    app._start_hook_scan()
+
+    app._leave_developer_to_settings()
+
+    assert app._hook_scan is None
+    assert app.state_machine.state == BoothState.SETTINGS
+    assert app.hook_switch is not None  # restored
+
+
+def test_render_dispatches_to_hook_scan_while_active(tmp_path, fake_gpio):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app.state_machine.transition(BoothState.DEVELOPER)
+    app._start_hook_scan()
+
+    frame = app.render(None)
+
+    assert frame is not None
+    assert "cancel" in app.renderer.hook_scan_rects
+
+
+def test_mouse_down_in_developer_dispatches_to_hook_scan_rects(tmp_path, fake_gpio):
+    app = _app(tmp_path)
+    app.state_machine.transition(BoothState.SETTINGS)
+    app.state_machine.transition(BoothState.DEVELOPER)
+    app._start_hook_scan()
+    app.render(None)
+    x0, y0, x1, y1 = app.renderer.hook_scan_rects["cancel"]
+
+    app._on_mouse(main_module.cv2.EVENT_LBUTTONDOWN, (x0 + x1) // 2, (y0 + y1) // 2, 0, None)
+
+    assert app._hook_scan is None
+
+
+def test_hook_scan_candidate_pins_fit_grid_capacity():
+    # render_hook_scan lays candidates out in a 5-column grid; more than
+    # 20 would need a layout change to avoid the button row overlapping
+    # the last grid row (see ui/renderer.py's _draw_hook_pin_grid).
+    assert len(main_module.HOOK_SCAN_CANDIDATE_PINS) <= 20
+    assert len(set(main_module.HOOK_SCAN_CANDIDATE_PINS)) == len(main_module.HOOK_SCAN_CANDIDATE_PINS)

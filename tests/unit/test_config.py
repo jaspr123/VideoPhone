@@ -321,6 +321,8 @@ def test_save_settings_covers_every_editable_key(tmp_path):
         "recording_mode": "fast",
         "live_mic_meter_enabled": True,
         "extended_mode": True,
+        "hook_switch_gpio_pin": 22,
+        "hook_switch_invert": True,
     }
     assert set(updates) == set(EDITABLE_SETTINGS_KEYS)
     config = BoothConfig.save_settings(path, updates, base_dir=tmp_path)
@@ -329,3 +331,28 @@ def test_save_settings_covers_every_editable_key(tmp_path):
     assert config.recording_mode == "fast"
     assert config.live_mic_meter_enabled is True
     assert config.extended_mode is True
+    assert config.hook_switch_gpio_pin == 22
+    assert config.hook_switch_invert is True
+
+
+def test_hook_switch_invert_defaults_to_false():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.hook_switch_invert is False
+
+
+def test_hook_switch_invert_can_be_turned_on():
+    config = BoothConfig.from_dict(valid_config_dict(hook_switch_invert=True))
+    assert config.hook_switch_invert is True
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_hook_switch_invert_rejects_non_bool(value):
+    with pytest.raises(ConfigError, match="hook_switch_invert"):
+        BoothConfig.from_dict(valid_config_dict(hook_switch_invert=value))
+
+
+def test_save_settings_can_change_hook_switch_pin_via_developer_wizard(tmp_path):
+    path = _write_config_file(tmp_path)
+    config = BoothConfig.save_settings(path, {"hook_switch_gpio_pin": 22}, base_dir=tmp_path)
+    assert config.hook_switch_gpio_pin == 22
+    assert config.hook_switch_invert is False  # untouched, still default
