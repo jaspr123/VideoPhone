@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased — Pre-roll gain calibration converges properly + fast peak limiter
+
+Real-world feedback: gain was still audibly too hot in actual recordings even
+with the existing countdown-time nudge. The nudge itself was a single, fixed
+±15% step applied once, right as recording started -- nowhere near enough to
+correct a baseline that's badly off, and it only ever fired once no matter
+how far off the reading was.
+
+- **`main.py`**: the mic check that already runs continuously through
+  PREVIEW + COUNTDOWN (`_start_mic_check`) now periodically re-evaluates and
+  re-nudges the capture gain (`_maybe_recalibrate_mic_gain`, called from
+  `tick()`) roughly once a second, up to `MIC_CALIBRATION_MAX_ADJUSTMENTS`
+  (8) real corrections, instead of applying a single nudge only at the very
+  end. Each check only looks at readings collected since the *last* check
+  (`_take_calibration_window`) rather than averaging across the whole
+  preview dwell, so a stale pre-adjustment reading can't mask how things
+  actually stand after a correction. `_start_recording`'s final nudge uses
+  the same windowed approach. This is still strictly pre-roll -- nothing
+  here runs once RECORDING has begun, so it's several one-shot nudges
+  spread across the lead-up, not continuous AGC (PROJECT_SPEC.md section 6
+  still applies: no gain riding once a message is actually being recorded).
+  `_apply_mic_gain_nudge` now takes a `context` label for clearer logs and
+  returns whether it actually changed anything, so the periodic caller only
+  spends its adjustment budget on real corrections.
+- **`config.py` / `media/ffmpeg.py`**: new `mic_limiter_enabled` field
+  (validated bool, default `True`, config-file only -- not in
+  `EDITABLE_SETTINGS_KEYS`, same as `av_sync_offset_ms`). When on,
+  `build_record_command`'s `-af` chain appends ffmpeg's `alimiter` filter
+  (fast attack/short release, ceiling around -3 dBFS true peak, auto-level
+  makeup gain disabled) after the existing `aresample` filter. This catches
+  an occasional loud peak *during* an actual recording without riding the
+  overall gain the way continuous AGC would -- it only engages on peaks
+  that actually cross the ceiling, so normal speech (which per spec should
+  already peak below -6 dBFS) never touches it.
+- **`config/booth.default.json`**: added `mic_limiter_enabled: true`.
+- Tests: `tests/unit/test_main.py` covers the periodic calibration's
+  interval gating, on-target no-op, and max-adjustment cap, plus that
+  `_take_calibration_window` advances without clearing `_mic_readings`
+  (DEVELOPER's `room_base_db` still needs the full history).
+  `tests/unit/test_config.py` and `tests/unit/test_ffmpeg.py` cover
+  `mic_limiter_enabled`'s validation and its effect on the built `-af`
+  filter chain (including the two existing exact-match `-af` assertions,
+  which now expect the limiter appended by default).
+
 ## Unreleased — DEVELOPER: "Find receiver switch" wizard
 
 Real-hardware feedback from the first Pi test of the Settings/Developer

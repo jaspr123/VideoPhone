@@ -20,6 +20,7 @@
   "recording_mode": "quality",
   "theme_dir": "themes/classic-walnut",
   "live_mic_meter_enabled": false,
+  "mic_limiter_enabled": true,
   "preview_seconds": 8,
   "extended_mode": false
 }

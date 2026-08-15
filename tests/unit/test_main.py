@@ -18,6 +18,7 @@ from video_guestbook.main import (
     _point_in_rect,
 )
 from video_guestbook.media.audio_levels import LevelReading
+from video_guestbook.media.mixer import GainNudgeResult
 from video_guestbook.media.recorder import RecordingSession
 from video_guestbook.state_machine import BoothState
 from video_guestbook.ui.theme import Theme
@@ -256,6 +257,95 @@ def test_cancel_to_ready_from_preview_stops_mic_check(tmp_path):
     assert app.state_machine.state == BoothState.READY
     assert app._preview_deadline is None
     assert app._mic_check_thread is None
+
+
+def _fake_nudge(calls):
+    def nudge(audio_device, delta_percent):
+        calls.append(delta_percent)
+        return GainNudgeResult(card_index=0, control="Mic", old_percent=50, new_percent=50 + delta_percent)
+
+    return nudge
+
+
+def test_take_calibration_window_advances_without_clearing_mic_readings(tmp_path):
+    app = _app(tmp_path)
+    with app._mic_readings_lock:
+        app._mic_readings = [_reading(-20.0), _reading(-18.0)]
+
+    window = app._take_calibration_window()
+
+    assert len(window) == 2
+    assert len(app._mic_readings) == 2  # room_base_db (DEVELOPER) needs the full history kept
+    assert app._take_calibration_window() == []  # already-consumed readings aren't replayed
+
+
+def test_maybe_recalibrate_noop_before_interval_elapses(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_module, "nudge_capture_gain", _fake_nudge(calls))
+    app = _app(tmp_path)
+    app._start_preview()
+    try:
+        with app._mic_readings_lock:
+            app._mic_readings = [_reading(0.0)]  # clearly too loud
+        app._maybe_recalibrate_mic_gain()  # interval just reset by _start_preview
+        assert calls == []
+        assert app._mic_calibration_count == 0
+    finally:
+        app._stop_mic_check()
+
+
+def test_maybe_recalibrate_applies_nudge_once_interval_elapses(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_module, "nudge_capture_gain", _fake_nudge(calls))
+    app = _app(tmp_path)
+    app._start_preview()
+    try:
+        with app._mic_readings_lock:
+            app._mic_readings = [_reading(0.0)]  # clearly too loud -> STATUS_TOO_LOUD
+        app._mic_calibration_last_at = time.monotonic() - main_module.MIC_RECALIBRATION_INTERVAL_SECONDS - 1
+
+        app._maybe_recalibrate_mic_gain()
+
+        assert calls == [-main_module.MIC_GAIN_NUDGE_PERCENT]
+        assert app._mic_calibration_count == 1
+    finally:
+        app._stop_mic_check()
+
+
+def test_maybe_recalibrate_skips_nudge_when_already_on_target(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_module, "nudge_capture_gain", _fake_nudge(calls))
+    app = _app(tmp_path)
+    app._start_preview()
+    try:
+        with app._mic_readings_lock:
+            app._mic_readings = [_reading(-20.0)]  # within the normal-speech range
+        app._mic_calibration_last_at = time.monotonic() - main_module.MIC_RECALIBRATION_INTERVAL_SECONDS - 1
+
+        app._maybe_recalibrate_mic_gain()
+
+        assert calls == []
+        assert app._mic_calibration_count == 0
+    finally:
+        app._stop_mic_check()
+
+
+def test_maybe_recalibrate_stops_at_max_adjustments(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_module, "nudge_capture_gain", _fake_nudge(calls))
+    app = _app(tmp_path)
+    app._start_preview()
+    try:
+        app._mic_calibration_count = main_module.MIC_CALIBRATION_MAX_ADJUSTMENTS
+        with app._mic_readings_lock:
+            app._mic_readings = [_reading(0.0)]
+        app._mic_calibration_last_at = time.monotonic() - main_module.MIC_RECALIBRATION_INTERVAL_SECONDS - 1
+
+        app._maybe_recalibrate_mic_gain()
+
+        assert calls == []
+    finally:
+        app._stop_mic_check()
 
 
 def test_cancel_to_ready_from_countdown_clears_countdown_deadline(tmp_path):

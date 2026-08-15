@@ -162,6 +162,22 @@ def test_live_mic_meter_enabled_rejects_non_bool(value):
         BoothConfig.from_dict(valid_config_dict(live_mic_meter_enabled=value))
 
 
+def test_mic_limiter_enabled_defaults_to_true():
+    config = BoothConfig.from_dict(valid_config_dict())
+    assert config.mic_limiter_enabled is True
+
+
+def test_mic_limiter_enabled_can_be_turned_off():
+    config = BoothConfig.from_dict(valid_config_dict(mic_limiter_enabled=False))
+    assert config.mic_limiter_enabled is False
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_mic_limiter_enabled_rejects_non_bool(value):
+    with pytest.raises(ConfigError, match="mic_limiter_enabled"):
+        BoothConfig.from_dict(valid_config_dict(mic_limiter_enabled=value))
+
+
 def test_preview_seconds_defaults_to_eight():
     config = BoothConfig.from_dict(valid_config_dict())
     assert config.preview_seconds == 8

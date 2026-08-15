@@ -49,7 +49,9 @@ def test_record_command_includes_proven_av_sync_flags(tmp_path):
     assert command.count("-thread_queue_size") == 2
     assert command.count("-use_wallclock_as_timestamps") == 2
     assert "-af" in command
-    assert command[command.index("-af") + 1] == "aresample=async=1:first_pts=0"
+    assert command[command.index("-af") + 1] == (
+        "aresample=async=1:first_pts=0," + ffmpeg_module._MIC_LIMITER_FILTER
+    )
     assert "-avoid_negative_ts" in command
     assert command[command.index("-avoid_negative_ts") + 1] == "make_zero"
     assert "-movflags" in command
@@ -214,7 +216,28 @@ def test_no_live_preview_output(tmp_path):
     command = ffmpeg_module.build_record_command(config, output_path)
 
     assert "-update" not in command
+    assert command[command.index("-af") + 1] == (
+        "aresample=async=1:first_pts=0," + ffmpeg_module._MIC_LIMITER_FILTER
+    )
+
+
+def test_mic_limiter_enabled_by_default_appends_alimiter(tmp_path):
+    config = make_config(tmp_path)
+    output_path = tmp_path / "recordings" / "session.mp4"
+
+    command = ffmpeg_module.build_record_command(config, output_path)
+
+    assert "alimiter=" in command[command.index("-af") + 1]
+
+
+def test_mic_limiter_disabled_omits_alimiter(tmp_path):
+    config = make_config(tmp_path, mic_limiter_enabled=False)
+    output_path = tmp_path / "recordings" / "session.mp4"
+
+    command = ffmpeg_module.build_record_command(config, output_path)
+
     assert command[command.index("-af") + 1] == "aresample=async=1:first_pts=0"
+    assert "alimiter=" not in command[command.index("-af") + 1]
 
 
 def test_build_transcode_command(tmp_path):

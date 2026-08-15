@@ -77,10 +77,24 @@ CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.3
 
 # Countdown-time microphone check (PROJECT_SPEC.md section 6, "Proposed
 # countdown audio check"): sample level while the guest is getting ready,
-# then apply a single, one-shot capture-gain nudge before recording starts.
-# Per the spec, gain is NOT adjusted continuously once recording begins.
+# then apply a capture-gain nudge before recording starts. Per the spec,
+# gain is NOT adjusted continuously once recording begins.
 MIC_CHECK_CHUNK_MS = 100
 MIC_GAIN_NUDGE_PERCENT = 15
+
+# Pre-roll gain calibration is applied repeatedly across PREVIEW + COUNTDOWN
+# (see _maybe_recalibrate_mic_gain) rather than as a single nudge right at
+# recording start -- a badly-off starting gain needs more than one ±15%
+# step to actually converge. This is still strictly pre-roll: nothing here
+# ever runs once RECORDING has begun, so it stays within PROJECT_SPEC.md's
+# "no continuous AGC during a message" rule -- it's several one-shot
+# nudges spread across the lead-up, not continuous gain riding. Bounded by
+# a max-adjustment cap so a reading that oscillates right at a
+# classification boundary can't hunt indefinitely; 8 corrections of ±15%
+# is enough to walk from either extreme (0% or 100%) to a mid-range level
+# well within the default preview_seconds + countdown_seconds dwell time.
+MIC_RECALIBRATION_INTERVAL_SECONDS = 1.0
+MIC_CALIBRATION_MAX_ADJUSTMENTS = 8
 
 # Live mic meter during RECORDING (config live_mic_meter_enabled, off by
 # default): a second AudioLevelReader on the same device ffmpeg is now
@@ -275,6 +289,17 @@ class BoothApp:
         self._mic_readings: list[LevelReading] = []
         self._latest_mic_reading: LevelReading | None = None
 
+        # Pre-roll gain calibration bookkeeping (see
+        # _maybe_recalibrate_mic_gain / _take_calibration_window). Reset
+        # whenever a fresh mic check starts (_start_mic_check) so each
+        # PREVIEW dwell gets its own budget and windowing, independent of
+        # _mic_readings itself -- that list also feeds the DEVELOPER
+        # screen's room_base_db (_developer_snapshot) and must keep its
+        # full history rather than being cleared on every calibration pass.
+        self._mic_calibration_next_index: int = 0
+        self._mic_calibration_last_at: float = 0.0
+        self._mic_calibration_count: int = 0
+
         # PREVIEW auto-advance (config preview_seconds): a guest who never
         # taps the record button (or whose tap the touchscreen missed)
         # still isn't stuck on the live-preview screen forever. Mirrors
@@ -462,6 +487,9 @@ class BoothApp:
             self._mic_readings = []
             if reset_latest:
                 self._latest_mic_reading = None
+        self._mic_calibration_next_index = 0
+        self._mic_calibration_last_at = time.monotonic()
+        self._mic_calibration_count = 0
         self._mic_check_stop_event.clear()
         self._mic_check_thread = threading.Thread(
             target=self._mic_check_loop, args=(context, start_delay_seconds), daemon=True
@@ -511,15 +539,18 @@ class BoothApp:
         with self._mic_readings_lock:
             return list(self._mic_readings)
 
-    def _apply_mic_gain_nudge(self, readings: list[LevelReading]) -> None:
-        """One-shot capture-gain adjustment from the countdown-time check.
+    def _apply_mic_gain_nudge(self, readings: list[LevelReading], context: str = "countdown") -> bool:
+        """One-shot capture-gain adjustment from a window of mic readings.
 
-        Never raises: a failure here (unknown mixer control, no card found,
-        etc) must not block recording, per architecture rule 17.
+        Returns True if a gain change was actually applied (used by
+        _maybe_recalibrate_mic_gain to spend its adjustment budget only on
+        real corrections, not on windows that were already fine). Never
+        raises: a failure here (unknown mixer control, no card found, etc)
+        must not block recording, per architecture rule 17.
         """
         if not readings:
-            self.logger.debug("no mic readings collected during countdown; skipping gain nudge")
-            return
+            self.logger.debug("no mic readings collected (%s); skipping gain nudge", context)
+            return False
 
         avg_rms = sum(r.rms_dbfs for r in readings) / len(readings)
         avg_peak = sum(r.peak_dbfs for r in readings) / len(readings)
@@ -527,30 +558,33 @@ class BoothApp:
 
         if status == STATUS_READY:
             self.logger.info(
-                "countdown mic check: %s (avg rms=%.1f peak=%.1f dBFS), no gain change",
+                "%s mic check: %s (avg rms=%.1f peak=%.1f dBFS), no gain change",
+                context,
                 status,
                 avg_rms,
                 avg_peak,
             )
-            return
+            return False
 
         delta = MIC_GAIN_NUDGE_PERCENT if status == STATUS_SPEAK_CLOSER else -MIC_GAIN_NUDGE_PERCENT
         try:
             result = nudge_capture_gain(self.config.audio_device, delta)
         except MixerError as exc:
             self.logger.warning(
-                "countdown mic check: %s (avg rms=%.1f peak=%.1f dBFS) but could not "
+                "%s mic check: %s (avg rms=%.1f peak=%.1f dBFS) but could not "
                 "adjust capture gain: %s",
+                context,
                 status,
                 avg_rms,
                 avg_peak,
                 exc,
             )
-            return
+            return False
 
         self.logger.info(
-            "countdown mic check: %s (avg rms=%.1f peak=%.1f dBFS) -> adjusted '%s' "
+            "%s mic check: %s (avg rms=%.1f peak=%.1f dBFS) -> adjusted '%s' "
             "capture from %d%% to %d%%",
+            context,
             status,
             avg_rms,
             avg_peak,
@@ -558,12 +592,51 @@ class BoothApp:
             result.old_percent,
             result.new_percent,
         )
+        return True
+
+    def _take_calibration_window(self) -> list[LevelReading]:
+        """Return mic readings collected since the last calibration check.
+
+        Advances _mic_calibration_next_index but leaves _mic_readings
+        itself untouched -- that list is also read in full by
+        _developer_snapshot (room_base_db), so calibration must not clear
+        or otherwise consume it.
+        """
+        with self._mic_readings_lock:
+            window = self._mic_readings[self._mic_calibration_next_index :]
+            self._mic_calibration_next_index = len(self._mic_readings)
+            return window
+
+    def _maybe_recalibrate_mic_gain(self) -> None:
+        """Periodic pre-roll gain check during PREVIEW/COUNTDOWN.
+
+        Called from tick() every frame but only actually samples/adjusts
+        once per MIC_RECALIBRATION_INTERVAL_SECONDS, and only up to
+        MIC_CALIBRATION_MAX_ADJUSTMENTS real corrections -- see the module-
+        level comment above those constants for why this is still "one-shot
+        nudges, several times" rather than continuous AGC.
+        """
+        if self._mic_calibration_count >= MIC_CALIBRATION_MAX_ADJUSTMENTS:
+            return
+        now = time.monotonic()
+        if now - self._mic_calibration_last_at < MIC_RECALIBRATION_INTERVAL_SECONDS:
+            return
+        self._mic_calibration_last_at = now
+
+        window = self._take_calibration_window()
+        if self._apply_mic_gain_nudge(window, context="preroll"):
+            self._mic_calibration_count += 1
 
     def _start_recording(self) -> None:
-        # Stop the countdown-time mic check and act on it before ffmpeg opens
-        # the audio device -- one process at a time, same as the camera.
-        readings = self._stop_mic_check()
-        self._apply_mic_gain_nudge(readings)
+        # Final pre-roll gain correction using only what's accumulated since
+        # the last periodic check (see _maybe_recalibrate_mic_gain) -- using
+        # the full PREVIEW+COUNTDOWN history here would blend pre- and
+        # post-adjustment audio into a misleading average. Then stop the
+        # mic check and act on it before ffmpeg opens the audio device --
+        # one process at a time, same as the camera.
+        final_window = self._take_calibration_window()
+        self._apply_mic_gain_nudge(final_window, context="final preroll")
+        self._stop_mic_check()
 
         # ffmpeg needs exclusive access to the camera device: release the
         # preview capture first and give the driver a moment to settle.
@@ -1055,11 +1128,13 @@ class BoothApp:
         state = self.state_machine.state
 
         if state == BoothState.PREVIEW and self._preview_deadline is not None:
+            self._maybe_recalibrate_mic_gain()
             if time.monotonic() >= self._preview_deadline:
                 self.logger.info("preview_seconds elapsed with no tap; auto-advancing")
                 self._start_countdown()
 
         elif state == BoothState.COUNTDOWN and self._countdown_deadline is not None:
+            self._maybe_recalibrate_mic_gain()
             if time.monotonic() >= self._countdown_deadline:
                 self._start_recording()
 

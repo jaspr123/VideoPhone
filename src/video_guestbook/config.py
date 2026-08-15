@@ -143,6 +143,17 @@ class BoothConfig:
     # and the meter falls back to the last countdown reading, same as when
     # this is off. See main.py's _start_recording_mic_meter().
     live_mic_meter_enabled: bool = False
+    # Fast peak limiter (ffmpeg's `alimiter` audio filter) applied to the
+    # live recording pass -- see media/ffmpeg.py's build_record_command.
+    # Distinct from the pre-roll gain calibration in main.py
+    # (_maybe_recalibrate_mic_gain): that sets the ALSA capture level once
+    # before recording starts, this catches occasional loud peaks *during*
+    # the recording itself without riding/hunting the gain the way a full
+    # AGC would -- PROJECT_SPEC.md section 6 warns continuous gain changes
+    # during a message cause pumping artifacts on this hardware; alimiter's
+    # fast attack/release only engages on peaks that actually cross the
+    # threshold, so it doesn't have that failure mode. On by default.
+    mic_limiter_enabled: bool = True
     # How long the PREVIEW screen (live camera, tap-to-record button) lingers
     # before auto-advancing into COUNTDOWN on its own -- a guest who never
     # taps the button (or whose tap the touchscreen missed) still isn't
@@ -286,6 +297,12 @@ class BoothConfig:
                 f"live_mic_meter_enabled must be a boolean, got {live_mic_meter_enabled!r}"
             )
 
+        mic_limiter_enabled = data.get("mic_limiter_enabled", True)
+        if not isinstance(mic_limiter_enabled, bool):
+            raise ConfigError(
+                f"mic_limiter_enabled must be a boolean, got {mic_limiter_enabled!r}"
+            )
+
         preview_seconds = data.get("preview_seconds", 8)
         if not isinstance(preview_seconds, int) or preview_seconds <= 0:
             raise ConfigError(f"preview_seconds must be a positive integer, got {preview_seconds!r}")
@@ -317,6 +334,7 @@ class BoothConfig:
             theme_dir=(base_dir / theme_dir).resolve(),
             audio_playback_device=audio_playback_device,
             live_mic_meter_enabled=live_mic_meter_enabled,
+            mic_limiter_enabled=mic_limiter_enabled,
             preview_seconds=preview_seconds,
             extended_mode=extended_mode,
         )

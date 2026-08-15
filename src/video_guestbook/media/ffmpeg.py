@@ -41,6 +41,24 @@ def find_ffprobe() -> str:
 _SOFTWARE_ENCODE_PRESET = "ultrafast"
 _SOFTWARE_ENCODE_BITRATE = "4M"
 
+# Fast peak limiter for the live recording pass (config mic_limiter_enabled,
+# on by default), catching a loud talker's peaks during an actual message
+# without riding/hunting the overall gain the way continuous AGC would --
+# PROJECT_SPEC.md section 6 explicitly warns continuous gain changes during
+# a message cause pumping artifacts on this hardware. alimiter's fast
+# attack/short release only engages when a peak actually crosses the
+# ceiling, so normal speech (spec target: peaks below -6 dBFS, see
+# media/audio_levels.py's LOUD_PEAK_DBFS) never touches it.
+#   limit=0.7  -- ceiling at ~-3.1 dBFS true peak: below CLIP_PEAK_DBFS
+#                 (-1 dBFS) with headroom, above the -6 dBFS "too loud"
+#                 threshold so ordinary speech is unaffected.
+#   attack=5   -- ms, fast enough to catch a sudden peak before it clips.
+#   release=50 -- ms, short enough to stay transparent between peaks.
+#   level=0    -- disable alimiter's automatic makeup-gain leveling; this
+#                 must only clamp peaks, never boost quiet passages.
+_MIC_LIMITER_FILTER = "alimiter=limit=0.7:attack=5:release=50:level=0"
+
+
 def is_live_video_copied(config: BoothConfig) -> bool:
     """True if the live recording command copies video with no re-encode.
 
@@ -81,7 +99,9 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
     aresample async filter, and avoid_negative_ts) match the confirmed
     working Beta prototype (legacy/booth.py) and fix real audio/video sync
     drift observed on this hardware -- do not remove them without re-testing
-    A/V sync on the Pi.
+    A/V sync on the Pi. The -af value is a comma-joined filter chain:
+    aresample is always present, and _MIC_LIMITER_FILTER (config
+    mic_limiter_enabled, on by default) is appended after it when enabled.
 
     config.av_sync_offset_ms applies a fixed, device-specific correction
     (PROJECT_SPEC.md section 21, known risk #7) via ffmpeg's -itsoffset:
@@ -141,6 +161,10 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
             str(config.record_fps),
         ]
 
+    audio_filters = ["aresample=async=1:first_pts=0"]
+    if config.mic_limiter_enabled:
+        audio_filters.append(_MIC_LIMITER_FILTER)
+
     command = (
         [ffmpeg, "-y"]
         + video_input
@@ -162,7 +186,7 @@ def build_record_command(config: BoothConfig, output_path: Path) -> list[str]:
             "-ac",
             str(config.audio_channels),
             "-af",
-            "aresample=async=1:first_pts=0",
+            ",".join(audio_filters),
             "-avoid_negative_ts",
             "make_zero",
             "-t",
